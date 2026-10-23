@@ -88,7 +88,7 @@ class Handler(socketserver.BaseRequestHandler):
                         assert stream.read(2) == b"\r\n"
                 else:
                     body.extend(stream.read(int(fields.get("content-length", 0))))
-                self.server.event(upload=target, size=len(body), trailers=trailers)
+                self.server.event(upload=target, size=len(body), trailers=trailers, body=list(body))
                 if target == "/close-request":
                     return
                 if target == "/invalid":
@@ -117,10 +117,12 @@ class Handler(socketserver.BaseRequestHandler):
                 prefix = b""
                 data = b"hello"
                 extra = b"X-Dup: a\r\nX-Dup: b\r\nX-Bin: \xff\r\n"
+                if target == "/echo" and "content-type" in fields:
+                    extra += b"Content-Type: " + fields["content-type"].encode("latin1") + b"\r\n"
                 status = b"200 OK"
                 if target == "/informational":
                     prefix = b"HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\n"
-                if target == "/upload":
+                if target in ("/upload", "/echo"):
                     data = bytes(body)
                 if target == "/policy-retry":
                     with self.server.lock:

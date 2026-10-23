@@ -70,6 +70,11 @@ export struct CloseReport {
         ++total_errors;
         if (errors.len() < usize(16)) errors.push(rstd::move(error));
     }
+    void merge(CloseReport report) {
+        total_errors += report.total_errors;
+        for (auto& error : report.errors)
+            if (errors.len() < usize(16)) errors.push(rstd::move(error));
+    }
 };
 export struct ResourceAmount {
     usize operations {}, tasks {}, resources {}, bytes {};

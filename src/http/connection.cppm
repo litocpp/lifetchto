@@ -20,6 +20,7 @@ auto tls_result(rstd::async::coro<licrypto::CryptoResult<T>> operation) -> coro<
 }
 #endif
 struct Connection {
+    bool                         http2 {};
     Option<rstd::net::TcpStream> tcp;
 #if RSTD_OS_UNIX
     Option<rstd::net::UnixStream> unix;
@@ -183,12 +184,19 @@ auto connect_to(Arc<NativeState>     client,
         if (tls.is_err()) co_return Err(tls_error(rstd::move(tls).unwrap_err()));
         connection.tls = Some(rstd::move(tls).unwrap());
         auto protocol  = connection.tls->application_protocol();
-        if (protocol.is_err() ||
-            (! protocol->is_empty() && protocol->as_slice() != "http/1.1"_str.as_bytes())) {
+        bool h2        = protocol.is_ok() && protocol->as_slice() == "h2"_str.as_bytes();
+        bool h1 = protocol.is_ok() &&
+                  (protocol->is_empty() || protocol->as_slice() == "http/1.1"_str.as_bytes());
+#if ! LITO_FEAT_HTTP2
+        h2 = false;
+#endif
+        if ((! h1 && ! h2) ||
+            (h1 && client->options.tls->version_policy() == VersionPolicy::Http2) ||
+            (h2 && client->options.tls->version_policy() == VersionPolicy::Http1)) {
             (void)co_await connection.close();
-            co_return Err(
-                Error::Unsupported(String::make("server negotiated unsupported ALPN"_str)));
+            co_return Err(Error::Unsupported("server negotiated unsupported ALPN"_Str));
         }
+        connection.http2 = h2;
 #else
         (void)co_await connection.close();
         co_return Err(Error::Unsupported(String::make("HTTPS requires feature tls"_str)));

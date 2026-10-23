@@ -831,10 +831,18 @@ auto valid_policy(const ExecutionPolicy& policy, bool store) -> bool {
                                          policy.retry->jitter.as_millis() < u64(3600000))) &&
            (policy.cache == CacheMode::Disabled || policy.cache == CacheMode::Bypass || store);
 }
+auto ClientConfig::validate() const -> Result<empty> {
+    if (! valid_policy(policy, cache.is_some()) || (cache.is_some() && ! cache->store()) ||
+        (total_timeout.is_some() && total_timeout->is_zero()))
+        return Err(Error::InvalidOptions(String::make("invalid HTTP policy or cache binding"_str)));
+    return Ok(empty {});
+}
 auto Client::make(EngineHandle engine, BackendBinding backend, ClientConfig config)
     -> Result<Client> {
-    if (! backend.backend() || ! valid_policy(config.policy, config.cache.is_some()))
-        return Err(Error::InvalidOptions(String::make("invalid HTTP policy or cache binding"_str)));
+    auto valid = config.validate();
+    if (valid.is_err()) return Err(rstd::move(valid).unwrap_err());
+    if (! backend.backend())
+        return Err(Error::InvalidOptions(String::make("null HTTP backend"_str)));
     auto scope = engine.scope();
     if (scope.is_err()) return Err(rstd::move(scope).unwrap_err());
     auto state =
@@ -886,8 +894,13 @@ auto Client::execute(ExecutionRequest request, ExecuteOptions options) const
         return Err(Rejected<ExecutionRequest> {
             Error::InvalidOptions(String::make("invalid HTTP policy or routing"_str)),
             rstd::move(request) });
-    if (state_->config.total_timeout.is_some()) {
-        auto deadline = Instant::now() + *state_->config.total_timeout;
+    auto total_timeout = options.total_timeout.is_some() ? options.total_timeout->duration()
+                                                         : state_->config.total_timeout;
+    if (total_timeout.is_some() && total_timeout->is_zero())
+        return Err(Rejected<ExecutionRequest> {
+            Error::InvalidOptions(String::make("zero total timeout"_str)), rstd::move(request) });
+    if (total_timeout.is_some()) {
+        auto deadline = Instant::now() + *total_timeout;
         if (options.transfer.deadline.is_none() || deadline < *options.transfer.deadline)
             options.transfer.deadline = Some(deadline);
     }

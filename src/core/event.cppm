@@ -45,6 +45,11 @@ export class Event {
     Arc<EventState> state_ { Arc<EventState>::make() };
 
 public:
+    auto clone() const -> Event {
+        Event e;
+        e.state_ = state_.clone();
+        return e;
+    }
     auto listen() const -> EventWait {
         auto f = state_->fields.lock().unwrap();
         return EventWait(state_.clone(), f->version);

@@ -13,46 +13,66 @@ struct BodyFields {
     Option<lihttpto::Headers>      trailers;
     Option<Error>                  error;
     Option<Error>                  cleanup_error;
+    Option<ResourcePermit>         metadata_permit;
     bool reusable {}, canceled {}, finished {}, consumed {}, reading {}, upload_done {},
         upload_closed {}, stop_upload {}, continued {}, released {}, dispatched {},
         upload_pulled {};
     u64 sent_bytes {}, accepted_bytes {}, received_bytes {};
 };
 struct BodyState {
-    rstd::sync::Mutex<BodyFields> fields { BodyFields {} };
-    Event                         changed;
-    Option<Instant>               deadline;
+    rstd::sync::Mutex<BodyFields>    fields { BodyFields {} };
+    Event                            changed;
+    Option<Instant>                  deadline;
+    rstd::sync::Mutex<Option<Event>> connection_changed { None<Event>() };
+    void                             notify() const {
+        changed.notify();
+        auto event = connection_changed.lock().unwrap();
+        if (event->is_some()) (*event)->notify();
+    }
     explicit BodyState(Option<Instant> deadline): deadline(deadline) {}
     void fail(Error e) {
+        bool changed = false;
         {
             auto f = fields.lock().unwrap();
             if (f->error.is_none()) {
+                changed = true;
                 if (f->queue.is_some()) f->queue->fail(e.clone());
                 f->error = Some(rstd::move(e));
             }
         }
-        changed.notify();
+        if (changed) notify();
     }
     void cancel(StopReason reason = StopReason::Canceled) {
+        bool changed = false;
         {
             auto f      = fields.lock().unwrap();
+            changed     = ! f->canceled || (reason == StopReason::Deadline && f->error.is_none());
             f->canceled = true;
             if (reason == StopReason::Deadline && f->error.is_none())
                 f->error = Some(Error::Timeout());
-            if (f->queue.is_some()) f->queue->fail(stop_error(reason));
+            if (changed && f->queue.is_some()) f->queue->fail(stop_error(reason));
         }
-        changed.notify();
+        if (changed) notify();
     }
 };
 struct Work {
     ExchangeRequest          request;
     lihttpto::RequestEncoder encoder;
     Arc<BodyState>           body;
+#if LITO_FEAT_HTTP2
+    Option<lihttpto::h2::Request> http2;
+#endif
 };
 struct SlotFields {
     Option<Work>           pending;
     Option<Arc<BodyState>> active;
     bool                   idle {}, closing {}, done {}, joined {};
+#if LITO_FEAT_HTTP2
+    bool                http2 {};
+    usize               http2_limit {}, http2_used {};
+    Vec<Work>           http2_pending;
+    Vec<Arc<BodyState>> http2_bodies;
+#endif
 };
 struct Slot {
     String                        origin;

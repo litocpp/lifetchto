@@ -4,11 +4,11 @@ version = "0.1.0"
 
 [[test]]
 name = "lifetchto-tests"
-sources = ["main.cpp", "core.cpp", "core_session.cpp", "policy.cpp", "client.cpp", "peer.cpp"]
+sources = ["main.cpp", "core.cpp", "core_session.cpp", "policy.cpp", "client.cpp", "peer.cpp", "http2.cpp"]
 link-stdlib = false
 
 [dependencies]
-lifetchto = { version = "0.1.0", features = ["http", "tls"] }
+lifetchto = { version = "0.1.0", features = ["http", "tls", "http2"] }
 rstd-test = { version = "0.1.9" }
 rstd-nostd = { version = "0.1.9", usage = "link" }
 

@@ -40,6 +40,9 @@ class PreparedExchange {
     UploadMetadata            upload_;
     RouteChoice               route_;
     CacheScope                cache_;
+#if LITO_FEAT_HTTP2
+    Option<lihttpto::h2::Request> http2_;
+#endif
 
 public:
     PreparedExchange(lihttpto::PreparedRequest request,
@@ -63,6 +66,11 @@ public:
                                 rstd::move(route),
                                 rstd::move(cache));
     }
+#if LITO_FEAT_HTTP2
+    auto request_for_http2() const { return request_.http2_request(); }
+    auto http2_request() const -> const Option<lihttpto::h2::Request>& { return http2_; }
+    void set_http2(lihttpto::h2::Request request) { http2_ = Some(rstd::move(request)); }
+#endif
     auto parts() const -> const lihttpto::RequestParts& { return request_.parts(); }
     auto encoder() const -> lihttpto::RequestEncoder { return request_.encoder(); }
     auto backend_identity() const -> const BackendIdentity& { return backend_; }
@@ -70,9 +78,12 @@ public:
     auto target() const -> const RouteChoice& { return route_; }
     auto cache_scope() const -> const CacheScope& { return cache_; }
     auto clone() const -> PreparedExchange {
-        return {
-            request_.clone(), backend_.clone(), upload_.clone(), route_.clone(), cache_.clone()
-        };
+        auto copy = PreparedExchange(
+            request_.clone(), backend_.clone(), upload_.clone(), route_.clone(), cache_.clone());
+#if LITO_FEAT_HTTP2
+        if (http2_.is_some()) copy.http2_ = Some(http2_->clone());
+#endif
+        return copy;
     }
 };
 struct ExchangeInput {

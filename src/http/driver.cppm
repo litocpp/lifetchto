@@ -1,5 +1,8 @@
 module lifetchto.http:driver;
 import :connection;
+#if LITO_FEAT_HTTP2
+import :h2_driver;
+#endif
 import :state;
 using namespace rstd::prelude;
 using namespace rstd::literals;
@@ -87,7 +90,7 @@ auto upload(Connection& connection, Work& work, const TransportOptions& options)
         auto f         = work.body->fields.lock().unwrap();
         f->upload_done = true;
     }
-    work.body->changed.notify();
+    work.body->notify();
     co_return Ok(empty {});
 }
 auto send_request(Connection& connection, Work& work, const TransportOptions& options)
@@ -174,7 +177,7 @@ auto read_response(Connection&                                      connection,
                             auto f       = work.body->fields.lock().unwrap();
                             f->continued = true;
                         }
-                        work.body->changed.notify();
+                        work.body->notify();
                     }
                     continue;
                 }
@@ -190,7 +193,7 @@ auto read_response(Connection&                                      connection,
                     f->reusable    = reusable;
                     f->head        = Some(rstd::move(decoded.head));
                 }
-                work.body->changed.notify();
+                work.body->notify();
             }
             if (decoder.is_some()) {
                 auto progress = (*decoder)->feed(bytes.as_slice());
@@ -206,7 +209,7 @@ auto read_response(Connection&                                      connection,
                         auto queued = f->queue->try_send(rstd::move(chunk));
                         if (queued.is_err()) co_return Err(rstd::move(queued).unwrap_err());
                     }
-                    work.body->changed.notify();
+                    work.body->notify();
                 }
                 bytes.advance(progress->consumed);
                 if (progress->status == lihttpto::DecodeStatus::Complete) {
@@ -220,7 +223,7 @@ auto read_response(Connection&                                      connection,
                         f->finished = true;
                         f->queue->finish();
                     }
-                    work.body->changed.notify();
+                    work.body->notify();
                     co_return Ok(reusable);
                 }
             }
@@ -240,7 +243,7 @@ auto read_response(Connection&                                      connection,
                     f->finished = true;
                     f->queue->finish();
                 }
-                work.body->changed.notify();
+                work.body->notify();
                 co_return Ok(reusable && ! eof);
             }
         }
@@ -292,12 +295,18 @@ auto driver(Arc<NativeState> client, Arc<Slot> slot) -> coro<empty> {
             if (source_closed.is_err())
                 f->cleanup_error = Some(source_closed.as_ref().unwrap_err().clone());
         }
-        work.body->changed.notify();
+        work.body->notify();
         slot->permit = None();
         client->changed.notify();
         co_return empty {};
     }
-    auto                                             connection = rstd::move(connected).unwrap();
+    auto connection = rstd::move(connected).unwrap();
+#if LITO_FEAT_HTTP2
+    if (connection.http2) {
+        co_await h2_driver(client.clone(), slot.clone(), rstd::move(connection), rstd::move(work));
+        co_return empty {};
+    }
+#endif
     Option<rstd::async::coro<Result<Bytes>>::Future> idle_read;
     bool                                             idle_failure = false;
     for (;;) {
@@ -351,7 +360,7 @@ auto driver(Arc<NativeState> client, Arc<Slot> slot) -> coro<empty> {
             auto f      = work.body->fields.lock().unwrap();
             f->released = true;
         }
-        work.body->changed.notify();
+        work.body->notify();
         idle_read          = Some(connection.recv(client->options.receive_window).into_future());
         auto idle_deadline = Instant::now() + client->options.idle_timeout;
         bool checkout      = false;
@@ -399,7 +408,7 @@ auto driver(Arc<NativeState> client, Arc<Slot> slot) -> coro<empty> {
         if (released.is_err()) f->cleanup_error = Some(released.as_ref().unwrap_err().clone());
         f->released = true;
     }
-    work.body->changed.notify();
+    work.body->notify();
     Option<Work> pending;
     {
         auto s    = slot->fields.lock().unwrap();
@@ -416,7 +425,7 @@ auto driver(Arc<NativeState> client, Arc<Slot> slot) -> coro<empty> {
             f->released = true;
             if (closed.is_err()) f->cleanup_error = Some(rstd::move(closed).unwrap_err());
         }
-        pending->body->changed.notify();
+        pending->body->notify();
     }
     slot->permit = None();
     client->changed.notify();

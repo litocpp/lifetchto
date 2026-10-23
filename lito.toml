@@ -15,6 +15,9 @@ default = true
 [features.tls]
 default = false
 
+[features.http2]
+default = false
+
 [dependencies]
 rstd-std = { version = "0.1.9", pub = true }
 lihttpto = { version = "0.1.1", pub = true, condition = "feature.http" }

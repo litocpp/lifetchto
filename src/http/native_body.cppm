@@ -12,7 +12,7 @@ struct NativeReadGuard {
             f->reading = false;
             if (! completed) f->canceled = true;
         }
-        state->changed.notify();
+        state->notify();
     }
 };
 auto read_body(Arc<BodyState> state) -> coro<Result<Option<Bytes>>> {
@@ -30,7 +30,7 @@ auto read_body(Arc<BodyState> state) -> coro<Result<Option<Bytes>>> {
         auto f      = state->fields.lock().unwrap();
         f->consumed = true;
     }
-    state->changed.notify();
+    state->notify();
     co_return rstd::move(part);
 }
 auto wait_body_release(Arc<BodyState> state) -> coro<Result<empty>> {

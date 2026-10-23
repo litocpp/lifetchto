@@ -186,12 +186,30 @@ private:
     friend class Client;
     auto state() const -> Arc<ExecutionObserverState> { return state_.clone(); }
 };
+class TotalTimeout {
+    Option<Duration> duration_;
+    explicit TotalTimeout(Option<Duration> duration): duration_(duration) {}
+
+public:
+    static auto disabled() -> TotalTimeout { return TotalTimeout(None()); }
+    static auto after(Duration duration) -> TotalTimeout { return TotalTimeout(Some(duration)); }
+    auto        duration() const -> Option<Duration> { return duration_; }
+};
 struct ExecuteOptions {
     TransferOptions           transfer;
     Option<ExecutionPolicy>   policy;
     Routing                   routing;
     String                    partition;
     Option<ExecutionObserver> report;
+    Option<TotalTimeout>      total_timeout;
+    auto                      clone() const -> ExecuteOptions {
+        return { transfer,
+                 policy.is_some() ? Some(policy->clone()) : None<ExecutionPolicy>(),
+                 routing.clone(),
+                 partition.clone(),
+                 report.is_some() ? Some(report->clone()) : None<ExecutionObserver>(),
+                 total_timeout };
+    }
 };
 struct ClientConfig {
     ExecutionPolicy      policy;
@@ -200,6 +218,12 @@ struct ClientConfig {
     Option<Duration>     total_timeout { Some(Duration::from_secs(u64(30))) };
     usize                drain_limit { 65536 };
     Duration             drain_timeout { Duration::from_secs(u64(1)) };
+    auto                 validate() const -> Result<empty>;
+    auto                 clone() const -> ClientConfig {
+        return { policy.clone(), cache.is_some() ? Some(cache->clone()) : None<StoreBinding>(),
+                 store_failure,  total_timeout,
+                 drain_limit,    drain_timeout };
+    }
 };
 struct ClientState;
 class Client {

@@ -17,6 +17,9 @@ void stop_client(const Arc<NativeState>& state) {
             {
                 auto s     = slot->fields.lock().unwrap();
                 s->closing = true;
+#if LITO_FEAT_HTTP2
+                for (const auto& body : s->http2_bodies) body->cancel();
+#endif
                 if (s->active.is_some()) (*s->active)->cancel();
                 if (s->pending.is_some()) s->pending->body->cancel();
             }
@@ -72,6 +75,9 @@ struct NativeSlotTask {
         {
             auto s     = connection->fields.lock().unwrap();
             s->closing = true;
+#if LITO_FEAT_HTTP2
+            for (const auto& body : s->http2_bodies) body->cancel();
+#endif
             if (s->active.is_some()) (*s->active)->cancel();
             if (s->pending.is_some()) s->pending->body->cancel();
         }
@@ -125,22 +131,36 @@ auto perform_exchange(Arc<AttemptData> attempt, TransferContext context)
             usize same {};
             for (const auto& slot : f->retired)
                 if (slot->origin == identity) ++same;
-            bool returning = false;
+            bool              returning = false;
+            Option<Arc<Slot>> idle_candidate;
             for (const auto& slot : f->slots) {
                 if (slot->origin != identity) continue;
                 ++same;
                 auto s = slot->fields.lock().unwrap();
+#if LITO_FEAT_HTTP2
+                if (s->http2 && ! s->closing && same_route(slot->route, route) &&
+                    s->http2_used < s->http2_limit) {
+                    selected = Some(slot.clone());
+                    break;
+                }
+#endif
                 if (! s->idle && ! s->closing && s->active.is_some()) {
                     auto b = (*s->active)->fields.lock().unwrap();
                     returning =
                         returning || (b->reusable && b->finished && b->consumed && b->upload_done &&
                                       b->upload_closed && ! b->canceled && b->error.is_none());
                 }
-                if (s->idle && ! s->closing && same_route(slot->route, route)) {
-                    s->idle  = false;
-                    selected = Some(slot.clone());
-                    break;
+                if (s->idle && ! s->closing && same_route(slot->route, route)
+#if LITO_FEAT_HTTP2
+                    && ! s->http2
+#endif
+                ) {
+                    if (idle_candidate.is_none()) idle_candidate = Some(slot.clone());
                 }
+            }
+            if (selected.is_none() && idle_candidate.is_some()) {
+                selected                                  = idle_candidate.take();
+                (*selected)->fields.lock().unwrap()->idle = false;
             }
             if (selected.is_none() && ! returning &&
                 f->slots.len() + f->retired.len() < state->options.max_connections &&
@@ -159,12 +179,29 @@ auto perform_exchange(Arc<AttemptData> attempt, TransferContext context)
                 launch   = true;
             }
             if (selected.is_some()) {
-                auto s         = (*selected)->fields.lock().unwrap();
-                s->active      = Some(body.clone());
-                s->pending     = Some(Work {
+                auto s    = (*selected)->fields.lock().unwrap();
+                auto work = Work {
                     ExchangeRequest({ prepared.parts().clone(), rstd::move(attempt->input->body) }),
                     prepared.encoder(),
-                    body.clone() });
+                    body.clone()
+#if LITO_FEAT_HTTP2
+                        ,
+                    prepared.http2_request().is_some() ? Some(prepared.http2_request()->clone())
+                                                       : None<lihttpto::h2::Request>()
+#endif
+                };
+#if LITO_FEAT_HTTP2
+                if (s->http2) {
+                    s->idle = false;
+                    ++s->http2_used;
+                    s->http2_bodies.push(body.clone());
+                    s->http2_pending.push(rstd::move(work));
+                } else
+#endif
+                {
+                    s->active  = Some(body.clone());
+                    s->pending = Some(rstd::move(work));
+                }
                 attempt->input = None();
                 if (queue.counted) {
                     --f->waiters;
@@ -241,7 +278,7 @@ auto perform_exchange(Arc<AttemptData> attempt, TransferContext context)
             f->released = true;
         }
         (*selected)->permit = None();
-        body->changed.notify();
+        body->notify();
         state->changed.notify();
         co_return Err(Error::Capacity());
     }
@@ -311,7 +348,7 @@ struct AttemptLease {
         auto f = body->fields.lock().unwrap();
         if (! f->released) {
             f->canceled = true;
-            body->changed.notify();
+            body->notify();
         }
     }
     auto release(ReleaseContext) const -> coro<Result<empty>> {
@@ -336,11 +373,12 @@ struct NativeAttempt {
                 f->released = true;
                 if (closed.is_err()) f->cleanup_error = Some(closed.as_ref().unwrap_err().clone());
             }
-            data->body->changed.notify();
+            data->body->notify();
             data->input = None();
             {
                 auto f = data->body->fields.lock().unwrap();
                 if (f->queue.is_some()) f->queue->release();
+                f->metadata_permit = None();
             }
             co_return rstd::move(closed);
         }
@@ -348,6 +386,7 @@ struct NativeAttempt {
         {
             auto f = data->body->fields.lock().unwrap();
             if (f->queue.is_some()) f->queue->release();
+            f->metadata_permit = None();
         }
         co_return rstd::move(result);
     }
@@ -386,6 +425,18 @@ auto NativeAttempt::run(TransferContext context, OutputSender<ResponseMessage> o
         co_return ProtocolCompletion { Err(rstd::move(rejected.error)), RemoteOutcome::Unknown };
     }
     auto owner = rstd::move(lease).unwrap();
+#if LITO_FEAT_HTTP2
+    if (data->input->prepared.http2_request().is_some()) {
+        auto permit = context.resources().try_reserve(ResourceAmount {
+            .bytes = data->native->options.head_limit + data->native->options.upload_window });
+        if (permit.is_err()) {
+            (void)co_await release({});
+            co_return ProtocolCompletion { Err(rstd::move(permit).unwrap_err()),
+                                           RemoteOutcome::NotDispatched };
+        }
+        data->body->fields.lock().unwrap()->metadata_permit = Some(rstd::move(*permit));
+    }
+#endif
     auto queue =
         co_await ByteQueue::make(context.resources(), data->native->options.receive_window);
     if (queue.is_err()) {
@@ -454,7 +505,9 @@ auto NativeBackend::make(ResourceContext resources, TransportOptions options)
     if (options.max_connections == usize() || options.max_connections_per_origin == usize() ||
         options.receive_window == usize() || options.upload_window == usize() ||
         options.head_limit < usize(16) || options.max_informational == usize() ||
-        options.max_connections > usize(65536) || options.max_waiters > usize(65536))
+        options.max_http2_streams == usize() || options.max_http2_streams > usize(1024) ||
+        options.receive_window > usize(0x7fffffff) || options.max_connections > usize(65536) ||
+        options.max_waiters > usize(65536))
         return Err(Error::InvalidOptions(String::make("invalid HTTP pool or buffer limits"_str)));
 #if LITO_FEAT_TLS
     if (options.tls.is_none()) {
@@ -495,11 +548,21 @@ auto NativeBackend::prepare(lihttpto::RequestParts parts,
         return Err(Error::InvalidOptions(String::make("invalid HTTP request metadata"_str)));
     auto identity = state_->identity.clone();
     auto cache    = CacheScope { identity.clone(), route.clone() };
-    return Ok(PreparedExchange::make(rstd::move(prepared).unwrap(),
-                                     rstd::move(identity),
-                                     rstd::move(upload),
-                                     rstd::move(route),
-                                     rstd::move(cache)));
+    auto result   = PreparedExchange::make(rstd::move(prepared).unwrap(),
+                                           rstd::move(identity),
+                                           rstd::move(upload),
+                                           rstd::move(route),
+                                           rstd::move(cache));
+#if LITO_FEAT_HTTP2 && LITO_FEAT_TLS
+    if (origin->scheme.as_str() == "https"_str &&
+        state_->options.tls->version_policy() != VersionPolicy::Http1) {
+        auto h2 = result.request_for_http2();
+        if (h2.is_err())
+            return Err(Error::InvalidOptions("request cannot be represented in HTTP/2"_Str));
+        result.set_http2(rstd::move(*h2));
+    }
+#endif
+    return Ok(rstd::move(result));
 }
 auto NativeBackend::operation(ExchangeInput input) const
     -> rstd::Result<PreparedOperation<ResponseMessage>, Rejected<ExchangeInput>> {

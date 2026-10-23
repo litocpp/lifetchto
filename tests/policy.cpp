@@ -867,3 +867,80 @@ TEST(HttpPolicy, AttemptHistoryIsBoundedAndKeepsTotalCount) {
     };
     runtime.block_on(run());
 }
+
+namespace
+{
+struct DeadlineRoute {
+    Arc<rstd::sync::Mutex<Option<lf::Instant>>> observed;
+    auto select(lihttpto::RequestParts, lf::TransferContext context) const
+        -> coro<lf::Result<h::RouteChoice>> {
+        *observed->lock().unwrap() = context.deadline();
+        auto delayed               = co_await context.delay(Duration::from_millis(u64(20)));
+        if (delayed.is_err()) co_return Err(rstd::move(delayed).unwrap_err());
+        co_return Ok(h::RouteChoice {});
+    }
+    void request_close() const {}
+    auto close() const -> coro<lf::Result<empty>> { co_return Ok(empty {}); }
+};
+} // namespace
+namespace rstd
+{
+template<>
+struct Impl<h::RouteProvider, DeadlineRoute> : ImplBase<DeadlineRoute> {
+    auto select(lihttpto::RequestParts p, lf::TransferContext c) const {
+        return this->self().select(rstd::move(p), rstd::move(c));
+    }
+    void request_close() const { this->self().request_close(); }
+    auto close() const { return this->self().close(); }
+};
+} // namespace rstd
+TEST(HttpPolicy, RequestTotalTimeoutOverridesDefaultAndKeepsHardDeadline) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        for (int mode = 0; mode < 6; ++mode) {
+            auto            engine = lf::Engine::make(runtime.handle()).unwrap();
+            auto            script = Script::make(Scenario {});
+            h::ClientConfig config;
+            config.total_timeout = Some(Duration::from_millis(u64(3)));
+            auto client =
+                h::Client::make(engine.handle(), binding(script.clone()), rstd::move(config))
+                    .unwrap();
+            auto deadline = Arc<rstd::sync::Mutex<Option<lf::Instant>>>::make(None<lf::Instant>());
+            h::ExecuteOptions options;
+            options.routing.shared_provider =
+                Some(Arc<rstd::dyn<h::RouteProvider>>::make(DeadlineRoute { deadline.clone() }));
+            if (mode == 1 || mode == 3) options.total_timeout = Some(h::TotalTimeout::disabled());
+            if (mode == 2)
+                options.total_timeout = Some(h::TotalTimeout::after(Duration::from_secs(u64(1))));
+            if (mode == 3)
+                options.transfer.deadline =
+                    Some(lf::Instant::now() + Duration::from_millis(u64(3)));
+            if (mode == 4)
+                options.total_timeout = Some(h::TotalTimeout::after(Duration::from_millis(u64(1))));
+            if (mode == 5) options.total_timeout = Some(h::TotalTimeout::after(Duration {}));
+            auto submitted = client.execute(request(), options.clone());
+            if (mode == 5) {
+                EXPECT_TRUE(submitted.is_err());
+                if (submitted.is_err()) {
+                    auto rejected = rstd::move(submitted).unwrap_err();
+                    EXPECT_TRUE(rejected.error.is_InvalidOptions());
+                    EXPECT_TRUE((co_await rejected.input.body.close()).is_ok());
+                }
+            } else {
+                auto transfer = rstd::move(submitted).unwrap();
+                auto result   = co_await finish(transfer);
+                if (mode == 1 || mode == 2)
+                    EXPECT_TRUE(result.is_ok());
+                else {
+                    EXPECT_TRUE(result.is_err());
+                    if (result.is_err()) EXPECT_TRUE(result.unwrap_err().is_Timeout());
+                }
+                if (mode == 1) EXPECT_TRUE(deadline->lock().unwrap()->is_none());
+            }
+            EXPECT_TRUE((co_await client.close()).is_ok());
+            EXPECT_TRUE((co_await engine.close()).is_ok());
+        }
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
