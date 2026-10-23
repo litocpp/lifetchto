@@ -68,6 +68,7 @@ class Handler(socketserver.BaseRequestHandler):
             pending = {}
             trailers = set()
             goaway = False
+            close_mode = "notify"
             while True:
                 data = sock.recv(65536)
                 if not data:
@@ -81,6 +82,8 @@ class Handler(socketserver.BaseRequestHandler):
                     if isinstance(event, h2.events.RequestReceived):
                         fields = dict(event.headers)
                         target = fields[b":path"].decode()
+                        if target in ("/close-eof", "/close-stall"):
+                            close_mode = target
                         requests[event.stream_id] = [target, bytearray(), fields]
                         self.server.event(connection=identity, stream=event.stream_id, target=target,
                                           headers=[(k.decode(), v.decode("latin1")) for k, v in event.headers])
@@ -117,6 +120,11 @@ class Handler(socketserver.BaseRequestHandler):
                             conn.send_headers(sid, [(b":status", status)] + extra, end_stream=True)
                             continue
                         conn.send_headers(sid, [(b":status", status), (b"content-length", str(len(body)).encode())] + extra)
+                        if target == "/truncated":
+                            conn.send_data(sid, body[:3], end_stream=False)
+                            sock.sendall(conn.data_to_send())
+                            sock.close()
+                            return
                         if target == "/slow":
                             continue
                         pending[sid] = body
@@ -131,6 +139,13 @@ class Handler(socketserver.BaseRequestHandler):
                         self.server.event(connection=identity, window=event.stream_id, credit=event.delta)
                     elif isinstance(event, h2.events.ConnectionTerminated):
                         self.server.event(connection=identity, goaway=int(event.error_code))
+                        if close_mode == "/close-eof":
+                            sock.close()
+                            return
+                        if close_mode == "/close-stall":
+                            time.sleep(.5)
+                            sock.close()
+                            return
                         try:
                             sock.unwrap()
                         except (OSError, ssl.SSLError):

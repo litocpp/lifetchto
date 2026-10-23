@@ -48,7 +48,10 @@ struct Connection {
     }
     auto close() -> coro<Result<empty>> {
 #if LITO_FEAT_TLS
-        if (tls.is_some()) return tls_result(rstd::move(tls.take().unwrap()).close());
+        if (tls.is_some())
+            return tls_result(rstd::move(tls.take().unwrap())
+                                  .close(http2 ? licrypto::tls::CloseMode::SendOnly
+                                               : licrypto::tls::CloseMode::WaitPeer));
 #endif
 #if RSTD_OS_UNIX
         if (unix.is_some()) return io_result(rstd::move(unix.take().unwrap()).close());

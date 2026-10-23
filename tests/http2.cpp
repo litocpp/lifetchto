@@ -428,3 +428,44 @@ TEST(H2Peer, ZeroIdleBudgetDoesNotPollActiveRequests) {
     };
     runtime.block_on(task());
 }
+
+TEST(H2Peer, CompletedStreamsCloseWithoutPeerAlert) {
+    if (! ::getenv("LIFETCHTO_H2_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto task    = [&]() -> coro<empty> {
+        for (auto path : array<ref<str>, 2> { "/close-eof"_str, "/close-stall"_str }) {
+            auto options              = h2_options();
+            options.tls_close_timeout = Duration::from_millis(u64(100));
+            auto client   = TestClient::make(runtime.handle(), rstd::move(options)).unwrap();
+            auto route    = h2_route();
+            auto response = (co_await h2_get(client, route, path)).unwrap();
+            EXPECT_EQ((co_await h2_text(response)).unwrap().as_str(), "hello"_str);
+#if defined(__linux__)
+            auto descriptors = h2_descriptors();
+#endif
+            EXPECT_TRUE((co_await client.close()).is_ok());
+#if defined(__linux__)
+            EXPECT_TRUE(h2_descriptors() < descriptors);
+#endif
+            EXPECT_TRUE((co_await client.close()).is_ok());
+        }
+        co_return empty {};
+    };
+    runtime.block_on(task());
+}
+
+TEST(H2Peer, TruncatedTlsDoesNotCompleteResponse) {
+    if (! ::getenv("LIFETCHTO_H2_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto task    = [&]() -> coro<empty> {
+        auto client   = TestClient::make(runtime.handle(), h2_options()).unwrap();
+        auto route    = h2_route();
+        auto response = co_await h2_get(client, route, "/truncated"_str);
+        bool failed   = response.is_err();
+        if (response.is_ok()) failed = (co_await h2_text(*response)).is_err();
+        EXPECT_TRUE(failed);
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        co_return empty {};
+    };
+    runtime.block_on(task());
+}
