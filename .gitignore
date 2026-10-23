@@ -1,0 +1,7 @@
+/build
+/.lito
+lito.lock
+/AGENTS.md
+/.vscode
+__pycache__/
+*.pyc

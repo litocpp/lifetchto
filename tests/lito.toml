@@ -1,0 +1,15 @@
+[package]
+name = "lifetchto-tests"
+version = "0.1.0"
+
+[[test]]
+name = "lifetchto-tests"
+sources = ["main.cpp", "core.cpp", "core_session.cpp", "policy.cpp", "client.cpp", "peer.cpp"]
+link-stdlib = false
+
+[dependencies]
+lifetchto = { version = "0.1.0", features = ["http", "tls"] }
+rstd-test = { version = "0.1.9" }
+rstd-nostd = { version = "0.1.9", usage = "link" }
+
+liserveto = { version = "0.1.0" }

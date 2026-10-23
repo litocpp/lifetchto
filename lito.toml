@@ -1,0 +1,25 @@
+[package]
+name = "lifetchto"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+authors = ["hypengw <hypengwip@gmail.com>"]
+
+[lib]
+name = "lifetchto"
+module = "lifetchto"
+archive = "lifetchto"
+
+[features.http]
+default = true
+
+[features.tls]
+default = false
+
+[dependencies]
+rstd-std = { version = "0.1.9", pub = true }
+lihttpto = { version = "0.1.1", pub = true, condition = "feature.http" }
+licrypto = { version = "0.2.0", features = ["openssl"], pub = true, condition = "feature.http && feature.tls" }
+
+[profile.base]
+exceptions = false
+rtti = false
