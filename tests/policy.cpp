@@ -173,6 +173,22 @@ struct Impl<h::ResponseSource, Source> : ImplBase<Source> {
 };
 template<>
 struct Impl<h::ExchangeBackend, Backend> : ImplBase<Backend> {
+    auto duplex(h::DuplexRequest input) const
+        -> rstd::Result<lf::PreparedOperation<lf::DuplexStream>, lf::Rejected<h::DuplexRequest>> {
+        return Err(lf::Rejected<h::DuplexRequest> {
+            lf::Error::Unsupported("test backend has no duplex transport"_Str),
+            rstd::move(input) });
+    }
+    auto capabilities() const -> h::BackendCapabilities {
+        return { .http1                   = true,
+                 .https                   = true,
+                 .explicit_routes         = true,
+                 .unknown_upload_length   = true,
+                 .upload_trailers         = true,
+                 .response_trailers       = true,
+                 .repeated_request_fields = true,
+                 .expect_continue         = true };
+    }
     auto prepare(lihttpto::RequestParts p, h::UploadMetadata u, h::RouteChoice r) const {
         return this->self().prepare(rstd::move(p), rstd::move(u), rstd::move(r));
     }
@@ -314,8 +330,9 @@ TEST(HttpPolicy, RetryReusesPreparationAndRoutingAndReportsEachAttempt) {
         h::ExecutionObserver observer;
         h::ExecuteOptions    options;
         options.report = Some(observer.clone());
-        options.routing.shared_provider =
-            Some(Arc<rstd::dyn<h::RouteProvider>>::make(Routes { script.clone() }));
+        options.routing =
+            Some(h::Routing { .shared_provider = Some(Arc<rstd::dyn<h::RouteProvider>>::make(
+                                  Routes { script.clone() })) });
         auto transfer = client.execute(request(), rstd::move(options)).unwrap();
         EXPECT_TRUE((co_await finish(transfer)).is_ok());
         auto report = (co_await observer.wait()).unwrap();
@@ -907,8 +924,9 @@ TEST(HttpPolicy, RequestTotalTimeoutOverridesDefaultAndKeepsHardDeadline) {
                     .unwrap();
             auto deadline = Arc<rstd::sync::Mutex<Option<lf::Instant>>>::make(None<lf::Instant>());
             h::ExecuteOptions options;
-            options.routing.shared_provider =
-                Some(Arc<rstd::dyn<h::RouteProvider>>::make(DeadlineRoute { deadline.clone() }));
+            options.routing =
+                Some(h::Routing { .shared_provider = Some(Arc<rstd::dyn<h::RouteProvider>>::make(
+                                      DeadlineRoute { deadline.clone() })) });
             if (mode == 1 || mode == 3) options.total_timeout = Some(h::TotalTimeout::disabled());
             if (mode == 2)
                 options.total_timeout = Some(h::TotalTimeout::after(Duration::from_secs(u64(1))));
@@ -940,6 +958,40 @@ TEST(HttpPolicy, RequestTotalTimeoutOverridesDefaultAndKeepsHardDeadline) {
             EXPECT_TRUE((co_await client.close()).is_ok());
             EXPECT_TRUE((co_await engine.close()).is_ok());
         }
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
+
+TEST(HttpPolicy, ConnectionPreparationReusesDefaultRouteAndAbsoluteDeadline) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        auto engine = lf::Engine::make(runtime.handle()).unwrap();
+        auto script = Script::make(Scenario {});
+        auto url    = lihttpto::Url::parse_http("http://example.test/socket"_str).unwrap();
+        auto route  = Arc<h::Route>::make(
+            h::Route::unix_socket(url, Bytes::copy_from_slice("socket"_str.as_bytes())).unwrap());
+        h::ClientConfig config;
+        config.routing.route = Some(route.clone());
+        config.total_timeout = Some(Duration::from_secs(u64(10)));
+        auto client =
+            h::Client::make(engine.handle(), binding(script.clone()), rstd::move(config)).unwrap();
+        h::DuplexOptions options;
+        auto             deadline = lf::Instant::now() + Duration::from_secs(u64(1));
+        options.transfer.deadline = Some(deadline);
+        auto plan = client.prepare_connection({ url.clone(), {} }, options).unwrap();
+        EXPECT_TRUE(Arc<h::Route>::ptr_eq(*plan.request.route.route, route));
+        EXPECT_EQ(plan.transfer.deadline, Some(deadline));
+        options.transfer.deadline = None();
+        options.total_timeout     = Some(h::TotalTimeout::disabled());
+        EXPECT_TRUE(
+            client.prepare_connection({ url.clone(), {} }, options)->transfer.deadline.is_none());
+        EXPECT_EQ(script->lock().unwrap()->prepared, usize());
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        auto rejected = client.prepare_connection({ url.clone(), {} }).unwrap_err();
+        EXPECT_TRUE(rejected.error.is_Closed());
+        EXPECT_EQ(rejected.input.url.as_ref(), url.as_ref());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
         co_return empty {};
     };
     runtime.block_on(run());

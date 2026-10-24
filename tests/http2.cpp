@@ -29,7 +29,7 @@ auto h2_url(ref<str> path, const char* port = "LIFETCHTO_H2_PORT") -> String {
 auto h2_options(VersionPolicy version = VersionPolicy::Automatic) -> TestClientOptions {
     auto path = rstd::ffi::CStr::from_ptr(::getenv("LIFETCHTO_H2_CA")).to_str().unwrap();
     auto pem  = rstd::fs::read(rstd::path::PathBuf::from(path).as_path()).unwrap();
-    licrypto::tls::Trust trust;
+    lifetchto::http::TlsOptions trust;
     trust.use_system_roots = false;
     trust.ca_pem.push(Bytes::copy_from_slice(pem.as_slice()));
     TestClientOptions options;
@@ -300,9 +300,9 @@ TEST(H2Peer, EngineCloseRetainsSourceAndNativeReleaseAcrossCanceledWait) {
                 UploadBody::from_source(H2ClosingSource { closes.clone() }, Some(u64()))))
         };
         http::ExecuteOptions execute;
-        execute.routing.route = Some(h2_route());
-        auto transfer         = client.execute(rstd::move(request), rstd::move(execute)).unwrap();
-        auto response         = (co_await transfer.output()).unwrap();
+        execute.routing = Some(http::Routing { .route = Some(h2_route()) });
+        auto transfer   = client.execute(rstd::move(request), rstd::move(execute)).unwrap();
+        auto response   = (co_await transfer.output()).unwrap();
 #if defined(__linux__)
         auto descriptors = h2_descriptors();
 #endif

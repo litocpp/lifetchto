@@ -35,6 +35,9 @@ struct ClientState {
           backend(this->binding.backend()),
           config(rstd::move(config)) {}
 };
+auto Client::capabilities() const -> BackendCapabilities {
+    return state_->backend->capabilities();
+}
 void stop_http_client(const Arc<ClientState>& state) {
     if (! state) return;
     {
@@ -45,6 +48,8 @@ void stop_http_client(const Arc<ClientState>& state) {
     if (state->binding.is_Owned()) state->backend->request_close();
     if (state->config.cache.is_some() && state->config.cache->is_Owned())
         state->config.cache->store()->request_close();
+    if (state->config.cookies.is_some() && state->config.cookies->is_Owned())
+        state->config.cookies->jar()->request_close();
 }
 void drop_http_client(const Arc<ClientState>& state) {
     if (! state) return;
@@ -64,6 +69,10 @@ auto finish_http_client(Arc<ClientState> state) -> coro<Result<empty>> {
     }
     if (state->config.cache.is_some() && state->config.cache->is_Owned()) {
         auto closed = co_await state->config.cache->store()->close();
+        if (closed.is_err()) report.add(rstd::move(closed).unwrap_err());
+    }
+    if (state->config.cookies.is_some() && state->config.cookies->is_Owned()) {
+        auto closed = co_await state->config.cookies->jar()->close();
         if (closed.is_err()) report.add(rstd::move(closed).unwrap_err());
     }
     Option<Error> error;
@@ -303,6 +312,11 @@ auto tap_next(Arc<TapState> state) -> coro<Result<Option<Bytes>>> {
         auto trailers = state->body.trailers();
         if (trailers.is_err()) {
             state->writer->request_abort();
+            if (trailers.as_ref().unwrap_err().is_Unsupported()) {
+                (void)co_await state->writer->abort();
+                state->fields.lock().unwrap()->active = false;
+                co_return rstd::move(result);
+            }
             co_return Err(rstd::move(trailers).unwrap_err());
         }
         auto committed = co_await state->writer->commit(trailers->is_some() ? rstd::move(**trailers)
@@ -443,7 +457,13 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
     auto                               backend = client->backend.clone();
     Option<Arc<rstd::dyn<CacheStore>>> store;
     if (client->config.cache.is_some()) store = Some(client->config.cache->store());
-    auto&                    request = *state->request;
+    Option<Arc<rstd::dyn<CookieJar>>> cookies;
+    if (state->options.cookies.is_Shared())
+        cookies = Some(state->options.cookies.as_Shared().value.clone());
+    else if (state->options.cookies.is_Inherit() && client->config.cookies.is_some())
+        cookies = Some(client->config.cookies->jar());
+    auto&                    request       = *state->request;
+    bool                     manual_cookie = request.parts.headers.contains("cookie"_str);
     usize                    redirects {}, retries {}, connect_retries {}, status_retries {};
     Vec<String>              visited;
     Option<PreparedExchange> prepared_hop;
@@ -455,10 +475,26 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
         if (context.cancellation().is_canceled())
             co_return ProtocolCompletion { Err(stop_error(*context.cancellation().reason())),
                                            RemoteOutcome::Unknown };
+        if (cookies.is_some() && ! manual_cookie) {
+            auto selected = (*cookies)->select(request.parts.url, cache_now());
+            if (selected.is_err())
+                co_return ProtocolCompletion { Err(rstd::move(selected).unwrap_err()),
+                                               RemoteOutcome::NotDispatched };
+            auto encoded = selected->encode();
+            auto current = request.parts.headers.get_unique_text("cookie"_str).unwrap();
+            bool changed = current.is_some() != ! encoded.is_empty() ||
+                           (current.is_some() && *current != encoded.as_str());
+            if (changed) {
+                request.parts.headers.remove("cookie"_str);
+                if (! encoded.is_empty())
+                    request.parts.headers.set("Cookie"_str, encoded.as_str()).unwrap();
+                prepared_hop = None();
+            }
+        }
         if (prepared_hop.is_none()) {
-            RouteChoice route { state->options.routing.route.clone() };
-            if (state->options.routing.shared_provider.is_some()) {
-                auto selected = co_await (*state->options.routing.shared_provider)
+            RouteChoice route { state->options.routing->route.clone() };
+            if (state->options.routing->shared_provider.is_some()) {
+                auto selected = co_await (*state->options.routing->shared_provider)
                                     ->select(request.parts.clone(), context.clone());
                 if (selected.is_err())
                     co_return ProtocolCompletion { Err(rstd::move(selected).unwrap_err()),
@@ -596,6 +632,19 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
         }
         auto message = rstd::move(response).unwrap();
         auto status  = message.head.status.value();
+        if (cookies.is_some()) {
+            for (auto value : message.head.headers.get_all("set-cookie"_str)) {
+                auto parsed = lihttpto::SetCookie::parse_bytes(value->as_slice());
+                if (parsed.is_err()) continue;
+                auto stored = (*cookies)->store(request.parts.url, *parsed, cache_now());
+                if (stored.is_err()) {
+                    message.body.cancel();
+                    (void)co_await attempt_control.close();
+                    co_return ProtocolCompletion { Err(rstd::move(stored).unwrap_err()),
+                                                   RemoteOutcome::Confirmed };
+                }
+            }
+        }
         if (request.parts.method.as_ref() != "GET"_str &&
             request.parts.method.as_ref() != "HEAD"_str &&
             request.parts.method.as_ref() != "OPTIONS"_str &&
@@ -715,6 +764,7 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
                     visited.push(String::make(request.parts.url.as_ref()));
                     request.parts.url = rstd::move(next);
                     if (! same) {
+                        manual_cookie = false;
                         for (auto name : array<ref<str>, 4> { "authorization"_str,
                                                               "proxy-authorization"_str,
                                                               "cookie"_str,
@@ -833,6 +883,8 @@ auto valid_policy(const ExecutionPolicy& policy, bool store) -> bool {
 }
 auto ClientConfig::validate() const -> Result<empty> {
     if (! valid_policy(policy, cache.is_some()) || (cache.is_some() && ! cache->store()) ||
+        (cookies.is_some() && ! cookies->jar()) ||
+        (routing.route.is_some() && routing.shared_provider.is_some()) ||
         (total_timeout.is_some() && total_timeout->is_zero()))
         return Err(Error::InvalidOptions(String::make("invalid HTTP policy or cache binding"_str)));
     return Ok(empty {});
@@ -880,6 +932,69 @@ auto Client::clone() const -> Client {
 auto Client::policy() const -> ExecutionPolicy {
     return state_->config.policy.clone();
 }
+auto Client::resources() const -> ResourceContext {
+    return state_->scope.resources();
+}
+auto resolve_transfer_options(TransferOptions      options,
+                              Option<TotalTimeout> override_timeout,
+                              Option<Duration>     default_timeout) -> Result<TransferOptions> {
+    auto duration = override_timeout.is_some() ? override_timeout->duration() : default_timeout;
+    if (duration.is_some() && duration->is_zero())
+        return Err(Error::InvalidOptions(String::make("zero total timeout"_str)));
+    if (duration.is_some()) {
+        auto deadline = Instant::now() + *duration;
+        if (options.deadline.is_none() || deadline < *options.deadline)
+            options.deadline = Some(deadline);
+    }
+    return Ok(options);
+}
+auto Client::prepare_connection(DuplexRequest request, DuplexOptions options) const
+    -> rstd::Result<ConnectionPlan, Rejected<DuplexRequest>> {
+    if (state_->fields.lock().unwrap()->closed)
+        return Err(Rejected<DuplexRequest> { Error::Closed(), rstd::move(request) });
+    auto transfer_options = resolve_transfer_options(
+        options.transfer, options.total_timeout, state_->config.total_timeout);
+    if (transfer_options.is_err())
+        return Err(Rejected<DuplexRequest> { rstd::move(transfer_options).unwrap_err(),
+                                             rstd::move(request) });
+    auto selected = request.clone();
+    if (selected.route.route.is_none()) {
+        if (state_->config.routing.shared_provider.is_some())
+            return Err(Rejected<DuplexRequest> {
+                Error::Unsupported(
+                    "connection requires an explicit route with a dynamic route provider"_Str),
+                rstd::move(request) });
+        selected.route.route = state_->config.routing.route.clone();
+    }
+    return Ok(ConnectionPlan { rstd::move(selected), *transfer_options });
+}
+auto Client::duplex(DuplexRequest request, DuplexOptions options) const
+    -> rstd::Result<PendingDuplex, Rejected<DuplexRequest>> {
+    auto plan = prepare_connection(request.clone(), options);
+    if (plan.is_err()) return Err(rstd::move(plan).unwrap_err());
+    auto prepared = state_->backend->duplex(rstd::move(plan->request));
+    if (prepared.is_err())
+        return Err(Rejected<DuplexRequest> { rstd::move(prepared).unwrap_err().error,
+                                             rstd::move(request) });
+    auto submitted = state_->scope.submit(rstd::move(prepared).unwrap(), plan->transfer);
+    if (submitted.is_err())
+        return Err(Rejected<DuplexRequest> { rstd::move(submitted).unwrap_err().error,
+                                             rstd::move(request) });
+    return Ok(PendingDuplex(rstd::move(submitted).unwrap()));
+}
+auto Client::upgrade(UpgradeRequest request, UpgradeOptions options) const
+    -> rstd::Result<PendingUpgrade, Rejected<UpgradeRequest>> {
+    if (options.handshake_timeout.is_zero() || options.header_bytes == usize() ||
+        options.header_bytes > usize(65536) || options.error_body_bytes > usize(65536) ||
+        request.handshake.bytes().len() > usize(65536))
+        return Err(Rejected<UpgradeRequest> { Error::InvalidOptions("invalid Upgrade limits"_Str),
+                                              rstd::move(request) });
+    auto pending = duplex(request.target.clone(), options.duplex);
+    if (pending.is_err())
+        return Err(Rejected<UpgradeRequest> { rstd::move(pending).unwrap_err().error,
+                                              rstd::move(request) });
+    return Ok(PendingUpgrade(rstd::move(pending).unwrap(), rstd::move(request.handshake), options));
+}
 auto Client::execute(ExecutionRequest request, ExecuteOptions options) const
     -> rstd::Result<Transfer<ResponseMessage>, Rejected<ExecutionRequest>> {
     {
@@ -887,23 +1002,26 @@ auto Client::execute(ExecutionRequest request, ExecuteOptions options) const
         if (f->closed)
             return Err(Rejected<ExecutionRequest> { Error::Closed(), rstd::move(request) });
     }
+    if (options.routing.is_none()) options.routing = Some(state_->config.routing.clone());
+    auto supported = state_->backend->capabilities().validate(
+        request.parts, request.body.metadata(), { options.routing->route.clone() });
+    if (supported.is_err())
+        return Err(
+            Rejected<ExecutionRequest> { rstd::move(supported).unwrap_err(), rstd::move(request) });
     auto policy =
         options.policy.is_some() ? options.policy->clone() : state_->config.policy.clone();
     if (! valid_policy(policy, state_->config.cache.is_some()) ||
-        (options.routing.route.is_some() && options.routing.shared_provider.is_some()))
+        (options.routing->route.is_some() && options.routing->shared_provider.is_some()) ||
+        (options.cookies.is_Shared() && ! options.cookies.as_Shared().value))
         return Err(Rejected<ExecutionRequest> {
             Error::InvalidOptions(String::make("invalid HTTP policy or routing"_str)),
             rstd::move(request) });
-    auto total_timeout = options.total_timeout.is_some() ? options.total_timeout->duration()
-                                                         : state_->config.total_timeout;
-    if (total_timeout.is_some() && total_timeout->is_zero())
-        return Err(Rejected<ExecutionRequest> {
-            Error::InvalidOptions(String::make("zero total timeout"_str)), rstd::move(request) });
-    if (total_timeout.is_some()) {
-        auto deadline = Instant::now() + *total_timeout;
-        if (options.transfer.deadline.is_none() || deadline < *options.transfer.deadline)
-            options.transfer.deadline = Some(deadline);
-    }
+    auto resolved = resolve_transfer_options(
+        options.transfer, options.total_timeout, state_->config.total_timeout);
+    if (resolved.is_err())
+        return Err(
+            Rejected<ExecutionRequest> { rstd::move(resolved).unwrap_err(), rstd::move(request) });
+    options.transfer = *resolved;
     auto report =
         options.report.is_some() ? options.report->state() : Arc<ExecutionObserverState>::make();
     auto transfer_options = options.transfer;

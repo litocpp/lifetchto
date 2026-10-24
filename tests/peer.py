@@ -10,15 +10,16 @@ import ssl
 import subprocess
 import threading
 import time
+from proxy_peer import ProxyHandler, SocksHandler
 
 class Peer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
-    def __init__(self, context=None):
+    def __init__(self, context=None, handler=None):
         self.context = context
         self.events = []
         self.lock = threading.Lock()
-        super().__init__(("127.0.0.1", 0), Handler)
+        super().__init__(("127.0.0.1", 0), handler or Handler)
     def event(self, **value):
         with self.lock:
             self.events.append(value)
@@ -28,6 +29,8 @@ class Peer(socketserver.ThreadingTCPServer):
         if self.context:
             try:
                 sock = self.context.wrap_socket(sock, server_side=True)
+                if self.context.verify_mode == ssl.CERT_REQUIRED:
+                    self.event(client_certificate=bool(sock.getpeercert()))
             except ssl.SSLError:
                 sock.close()
                 raise
@@ -36,10 +39,29 @@ class Peer(socketserver.ThreadingTCPServer):
 class UnixPeer(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
     event = Peer.event
-    def __init__(self, path):
+    def __init__(self, path, handler=None):
         self.events = []
         self.lock = threading.Lock()
-        super().__init__(str(path), Handler)
+        super().__init__(str(path), handler or Handler)
+
+class RawHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        self.server.event(opened=True)
+        self.request.settimeout(5)
+        try:
+            self.request.sendall(b"ready")
+            while True:
+                data = self.request.recv(65536)
+                if not data:
+                    self.server.event(input_eof=True)
+                    self.request.sendall(b"after-eof")
+                    break
+                self.server.event(data=list(data))
+                self.request.sendall(data)
+        except OSError:
+            pass
+        finally:
+            self.server.event(closed=True)
 
 class StallHandler(socketserver.BaseRequestHandler):
     def handle(self):
@@ -97,8 +119,9 @@ class Handler(socketserver.BaseRequestHandler):
                 if target == "/truncated":
                     self.request.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab")
                     return
-                if target == "/chunked":
-                    self.request.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                if target in ("/chunked", "/adapter-chunked-cache"):
+                    policy = b"Cache-Control: max-age=60\r\n" if target == "/adapter-chunked-cache" else b""
+                    self.request.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n" + policy + b"\r\n")
                     for part in (b"3\r\nabc", b"\r\n2\r\nde\r\n", b"0\r\nX-End: yes\r\n\r\n"):
                         self.request.sendall(part)
                         time.sleep(0.01)
@@ -120,6 +143,29 @@ class Handler(socketserver.BaseRequestHandler):
                 if target == "/echo" and "content-type" in fields:
                     extra += b"Content-Type: " + fields["content-type"].encode("latin1") + b"\r\n"
                 status = b"200 OK"
+                if target == "/error":
+                    status = b"503 Service Unavailable"
+                    data = b"failed"
+                if target == "/adapter-retry":
+                    with self.server.lock:
+                        count = sum(e.get("target") == target for e in self.server.events)
+                    if count % 3:
+                        status = b"503 Service Unavailable"
+                        extra += b"Retry-After: 0\r\n"
+                if target == "/adapter-307":
+                    status = b"307 Temporary Redirect"
+                    extra += b"Location: /echo\r\n"
+                if target == "/cookie-start":
+                    status = b"302 Found"
+                    data = b""
+                    extra += b"Location: /cookie/check\r\nSet-Cookie: sid=one; Path=/; HttpOnly\r\nSet-Cookie: token=two; Path=/cookie\r\n"
+                if target.startswith("/cookie/"):
+                    data = fields.get("cookie", "").encode("latin1")
+                if target == "/cookie/retry" and "retry=yes" not in fields.get("cookie", ""):
+                    status = b"503 Service Unavailable"
+                    extra += b"Retry-After: 0\r\nSet-Cookie: retry=yes; Path=/cookie\r\n"
+                if target == "/cookie/no-store":
+                    extra += b"Cache-Control: max-age=60\r\nSet-Cookie: fresh=yes; Path=/cookie\r\n"
                 if target == "/informational":
                     prefix = b"HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\n"
                 if target in ("/upload", "/echo"):
@@ -150,7 +196,7 @@ class Handler(socketserver.BaseRequestHandler):
                     data = b"x" * 1024
                 if target == "/large":
                     data = b"x" * (512 * 1024)
-                if target == "/slow-body":
+                if target in ("/slow-body", "/rate-slow-body"):
                     data = b"slow"
                 if target in ("/empty", "/204", "/304") or method == "HEAD":
                     data = b""
@@ -176,9 +222,12 @@ class Handler(socketserver.BaseRequestHandler):
                     data = fields.get("x-mode", "unset").encode()
                     extra += b"Cache-Control: max-age=60\r\nVary: X-Mode\r\n"
                 length = b"" if target == "/204" else b"Content-Length: " + str(len(data)).encode() + b"\r\n"
+                if target == "/close-buffered":
+                    self.request.sendall(prefix + b"HTTP/1.1 " + status + b"\r\n" + length + extra + b"Connection: close\r\n\r\n" + data)
+                    return
                 self.request.sendall(prefix + b"HTTP/1.1 " + status + b"\r\n" + length + extra + b"\r\n")
-                if target == "/slow-body":
-                    time.sleep(0.3)
+                if target in ("/slow-body", "/rate-slow-body"):
+                    time.sleep(0.3 if target == "/slow-body" else 2.5)
                 self.request.sendall(data)
                 if target == "/idle-unclean":
                     unclean = True
@@ -205,6 +254,8 @@ def main():
     parser.add_argument("--work-dir", required=True)
     parser.add_argument("--filter", default="Peer.*")
     parser.add_argument("--consumer", choices=("http", "tls", "ncrequest"))
+    parser.add_argument("--duplex", action="store_true")
+    parser.add_argument("--proxy", action="store_true")
     args = parser.parse_args()
     work = Path(args.work_dir).resolve()
     work.mkdir(parents=True, exist_ok=True)
@@ -228,14 +279,53 @@ def main():
     expired = Peer(expired_context)
     stall = socketserver.ThreadingTCPServer(("127.0.0.1", 0), StallHandler)
     stall.daemon_threads = True
-    servers = [plain, tls, unix, no_alpn, expired, stall]
+    mutual_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    mutual_context.load_cert_chain(cert, key)
+    mutual_context.load_verify_locations(cert)
+    mutual_context.verify_mode = ssl.CERT_REQUIRED
+    mutual_context.set_alpn_protocols(["http/1.1"])
+    mutual = Peer(mutual_context)
+    wrong_cert = work / "wrong-name.pem"
+    subprocess.run(["openssl", "req", "-x509", "-key", str(key), "-out", str(wrong_cert), "-days", "1", "-subj", "/CN=wrong.test", "-addext", "subjectAltName=DNS:wrong.test"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    wrong_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    wrong_context.load_cert_chain(wrong_cert, key)
+    wrong_context.set_alpn_protocols(["http/1.1"])
+    wrong = Peer(wrong_context)
+    servers = [plain, tls, unix, no_alpn, expired, stall, mutual, wrong]
+    raw = {}
+    if args.duplex or args.proxy:
+        (work / "duplex.sock").unlink(missing_ok=True)
+        raw = {"raw_tcp": Peer(handler=RawHandler), "raw_tls": Peer(context, RawHandler), "raw_unix": UnixPeer(work / "duplex.sock", RawHandler)}
+        servers.extend(raw.values())
+    proxies = {}
+    if args.proxy:
+        proxies = {"proxy_http": Peer(handler=ProxyHandler), "proxy_https": Peer(context, ProxyHandler), "proxy_socks": Peer(handler=SocksHandler)}
+        for server in proxies.values():
+            server.allowed_ports = {value.server_address[1] for value in servers if isinstance(value.server_address, tuple)}
+            server.coalesce_port = raw["raw_tcp"].server_address[1]
+        servers.extend(proxies.values())
     for server in servers:
         threading.Thread(target=server.serve_forever, daemon=True).start()
-    env = dict(os.environ, LIFETCHTO_PEER_PORT=str(plain.server_address[1]), LIFETCHTO_TLS_PORT=str(tls.server_address[1]), LIFETCHTO_CA=str(cert), LIFETCHTO_UNIX_PATH=str(work / "http.sock"), LIFETCHTO_NO_ALPN_PORT=str(no_alpn.server_address[1]), LIFETCHTO_EXPIRED_PORT=str(expired.server_address[1]), LIFETCHTO_STALL_PORT=str(stall.server_address[1]))
+    env = dict(os.environ, LIFETCHTO_PEER_PORT=str(plain.server_address[1]), LIFETCHTO_TLS_PORT=str(tls.server_address[1]), LIFETCHTO_CA=str(cert), LIFETCHTO_UNIX_PATH=str(work / "http.sock"), LIFETCHTO_NO_ALPN_PORT=str(no_alpn.server_address[1]), LIFETCHTO_EXPIRED_PORT=str(expired.server_address[1]), LIFETCHTO_STALL_PORT=str(stall.server_address[1]), LIFETCHTO_COOKIE_FILE=str(work / "cookies.txt"))
+    env.update(LIFETCHTO_MTLS_PORT=str(mutual.server_address[1]), LIFETCHTO_WRONG_NAME_PORT=str(wrong.server_address[1]), LIFETCHTO_WRONG_NAME_CA=str(wrong_cert), LIFETCHTO_CLIENT_KEY=str(key))
+    if raw:
+        env.update(LIFETCHTO_DUPLEX_PORT=str(raw["raw_tcp"].server_address[1]), LIFETCHTO_DUPLEX_TLS_PORT=str(raw["raw_tls"].server_address[1]), LIFETCHTO_DUPLEX_UNIX_PATH=str(work / "duplex.sock"))
+    if proxies:
+        env.update(LIFETCHTO_PROXY_PORT=str(proxies["proxy_http"].server_address[1]), LIFETCHTO_HTTPS_PROXY_PORT=str(proxies["proxy_https"].server_address[1]), LIFETCHTO_SOCKS_PORT=str(proxies["proxy_socks"].server_address[1]))
     try:
         argument = ("https://127.0.0.1:" + str(tls.server_address[1]) + "/ok") if args.consumer == "tls" else ("http://127.0.0.1:" + str(plain.server_address[1]) + "/ok") if args.consumer else "--gtest_filter=" + args.filter
         result = subprocess.run([str(Path(args.binary).resolve()), argument], env=env, timeout=60)
-        events = {"http": plain.events, "tls": tls.events, "unix": unix.events, "no_alpn": no_alpn.events, "expired": expired.events}
+        events = {"http": plain.events, "tls": tls.events, "unix": unix.events, "no_alpn": no_alpn.events, "expired": expired.events, "mutual": mutual.events, "wrong": wrong.events}
+        if raw:
+            until = time.monotonic() + 1
+            while time.monotonic() < until and any(sum(e.get("opened", False) for e in server.events) != sum(e.get("closed", False) for e in server.events) for server in raw.values()):
+                time.sleep(0.005)
+            events.update({name: server.events for name, server in raw.items()})
+        if proxies:
+            until = time.monotonic() + 1
+            while time.monotonic() < until and any(sum(e.get("proxy_opened", False) for e in server.events) != sum(e.get("proxy_closed", False) for e in server.events) for server in proxies.values()):
+                time.sleep(0.005)
+            events.update({name: server.events for name, server in proxies.items()})
         (work / "events.json").write_text(json.dumps(events, indent=2))
         if result.returncode:
             raise SystemExit(result.returncode)

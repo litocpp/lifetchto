@@ -292,6 +292,7 @@ public:
     }
     auto get() -> T& { return access_; }
     auto get() const -> const T& { return access_; }
+    auto is_released() const -> bool { return record_->finished(); }
     auto into_scope() && -> T {
         auto registration = rstd::move(record_);
         return rstd::move(access_);

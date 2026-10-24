@@ -337,6 +337,16 @@ public:
         auto f = state_->fields.lock().unwrap();
         return state_->capacity - f->buffered;
     }
+    auto changed() const -> EventWait { return state_->changed.listen(); }
+    auto readable() const -> Result<bool> {
+        if (state_->cancellation.is_canceled())
+            return Err(stop_error(*state_->cancellation.reason()));
+        auto f = state_->fields.lock().unwrap();
+        if (f->error.is_some()) return Err(f->error->clone());
+        return Ok(! f->queue.is_empty() || f->finished);
+    }
+    auto wait_readable() const -> coro<Result<empty>>;
+    auto wait_writable() const -> coro<Result<empty>>;
     auto try_send(Bytes bytes) const -> Result<empty> {
         if (state_->cancellation.is_canceled())
             return Err(stop_error(*state_->cancellation.reason()));
@@ -353,6 +363,7 @@ public:
     }
     auto send(Bytes bytes) const -> coro<Result<empty>>;
     auto next(usize maximum = usize(65536)) const -> coro<Result<Option<Bytes>>>;
+    auto try_next(usize maximum = usize(65536)) const -> Result<Option<Option<Bytes>>>;
     void finish() const {
         {
             auto f      = state_->fields.lock().unwrap();
@@ -396,6 +407,28 @@ auto queue_changed(Arc<ByteQueueState> state, EventWait event) -> coro<Result<em
     }
     co_return Ok(empty {});
 }
+auto wait_queue_state(Arc<ByteQueueState> state, bool writing) -> coro<Result<empty>> {
+    for (;;) {
+        auto event = state->changed.listen();
+        if (state->cancellation.is_canceled())
+            co_return Err(stop_error(*state->cancellation.reason()));
+        {
+            auto f = state->fields.lock().unwrap();
+            if (f->error.is_some()) co_return Err(f->error->clone());
+            if (writing && f->finished) co_return Err(Error::Closed());
+            if (writing ? f->buffered < state->capacity : ! f->queue.is_empty() || f->finished)
+                co_return Ok(empty {});
+        }
+        auto changed = co_await queue_changed(state.clone(), rstd::move(event));
+        if (changed.is_err()) co_return Err(rstd::move(changed).unwrap_err());
+    }
+}
+auto ByteQueue::wait_readable() const -> coro<Result<empty>> {
+    return wait_queue_state(state_.clone(), false);
+}
+auto ByteQueue::wait_writable() const -> coro<Result<empty>> {
+    return wait_queue_state(state_.clone(), true);
+}
 auto ByteQueue::make(ResourceContext context, usize capacity) -> coro<Result<ByteQueue>> {
     if (capacity == usize())
         co_return Err(Error::InvalidOptions(String::make("zero byte queue capacity"_str)));
@@ -417,9 +450,38 @@ struct QueueReadGuard {
         state->changed.notify();
     }
 };
+auto take_queued(const Arc<ByteQueueState>& state, usize maximum) -> Result<Option<Option<Bytes>>> {
+    auto f = state->fields.lock().unwrap();
+    if (f->error.is_some()) return Err(f->error->clone());
+    if (state->deadline.is_some() && Instant::now() >= *state->deadline)
+        return Err(Error::Timeout());
+    if (state->cancellation.is_canceled()) return Err(stop_error(*state->cancellation.reason()));
+    if (! f->queue.is_empty()) {
+        auto bytes = f->queue[usize()].clone();
+        if (bytes.len() > maximum) {
+            bytes = bytes.slice(usize(), maximum);
+            f->queue[usize()].advance(maximum);
+        } else
+            f->queue.remove(usize());
+        f->buffered -= bytes.len();
+        state->changed.notify();
+        return Ok(Some(Some(rstd::move(bytes))));
+    }
+    if (f->finished) return Ok(Some(None<Bytes>()));
+    return Ok(None<Option<Bytes>>());
+}
+auto ByteQueue::try_next(usize maximum) const -> Result<Option<Option<Bytes>>> {
+    if (maximum == usize()) return Err(Error::InvalidOptions("zero read window"_Str));
+    {
+        auto f = state_->fields.lock().unwrap();
+        if (f->reading) return Err(Error::Busy());
+        f->reading = true;
+    }
+    QueueReadGuard guard { state_.clone(), true };
+    return take_queued(state_, maximum);
+}
 auto queue_next(Arc<ByteQueueState> state, usize maximum) -> coro<Result<Option<Bytes>>> {
-    if (maximum == usize())
-        co_return Err(Error::InvalidOptions(String::make("zero read window"_str)));
+    if (maximum == usize()) co_return Err(Error::InvalidOptions("zero read window"_Str));
     {
         auto f = state->fields.lock().unwrap();
         if (f->reading) co_return Err(Error::Busy());
@@ -428,41 +490,19 @@ auto queue_next(Arc<ByteQueueState> state, usize maximum) -> coro<Result<Option<
     QueueReadGuard guard { state.clone() };
     for (;;) {
         auto event = state->changed.listen();
-        {
-            auto f = state->fields.lock().unwrap();
-            if (f->error.is_some()) {
-                guard.complete = true;
-                co_return Err(f->error->clone());
-            }
-            if (state->deadline.is_some() && Instant::now() >= *state->deadline) {
-                guard.complete = true;
-                co_return Err(Error::Timeout());
-            }
-            if (state->cancellation.is_canceled()) {
-                guard.complete = true;
-                co_return Err(stop_error(*state->cancellation.reason()));
-            }
-            if (! f->queue.is_empty()) {
-                auto bytes = f->queue[usize()].clone();
-                if (bytes.len() > maximum) {
-                    bytes = bytes.slice(usize(), maximum);
-                    f->queue[usize()].advance(maximum);
-                } else
-                    f->queue.remove(usize());
-                f->buffered -= bytes.len();
-                guard.complete = true;
-                state->changed.notify();
-                co_return Ok(Some(rstd::move(bytes)));
-            }
-            if (f->finished) {
-                guard.complete = true;
-                co_return Ok(None());
-            }
-        }
-        auto ready = co_await queue_changed(state.clone(), rstd::move(event));
+        auto ready = take_queued(state, maximum);
         if (ready.is_err()) {
             guard.complete = true;
             co_return Err(rstd::move(ready).unwrap_err());
+        }
+        if (ready->is_some()) {
+            guard.complete = true;
+            co_return Ok(ready->take().unwrap());
+        }
+        auto changed = co_await queue_changed(state.clone(), rstd::move(event));
+        if (changed.is_err()) {
+            guard.complete = true;
+            co_return Err(rstd::move(changed).unwrap_err());
         }
     }
 }

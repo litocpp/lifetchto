@@ -29,7 +29,7 @@ auto get(TestClient& client, ref<str> path) -> coro<lifetchto::Result<String>> {
     co_return co_await body.text(usize(1024 * 1024));
 }
 auto tls_options() -> TestClientOptions {
-    licrypto::tls::Trust trust;
+    lifetchto::http::TlsOptions trust;
     trust.use_system_roots = false;
     auto path              = rstd::path::PathBuf::from(env_text("LIFETCHTO_CA"));
     auto pem               = rstd::fs::read(path.as_path()).unwrap();

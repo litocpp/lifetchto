@@ -1,5 +1,7 @@
 export module lifetchto.http:client;
 export import :cache;
+export import :cookie;
+export import :upgrade;
 using namespace rstd::prelude;
 export namespace lifetchto::http
 {
@@ -186,43 +188,43 @@ private:
     friend class Client;
     auto state() const -> Arc<ExecutionObserverState> { return state_.clone(); }
 };
-class TotalTimeout {
-    Option<Duration> duration_;
-    explicit TotalTimeout(Option<Duration> duration): duration_(duration) {}
-
-public:
-    static auto disabled() -> TotalTimeout { return TotalTimeout(None()); }
-    static auto after(Duration duration) -> TotalTimeout { return TotalTimeout(Some(duration)); }
-    auto        duration() const -> Option<Duration> { return duration_; }
-};
 struct ExecuteOptions {
     TransferOptions           transfer;
     Option<ExecutionPolicy>   policy;
-    Routing                   routing;
+    Option<Routing>           routing;
     String                    partition;
     Option<ExecutionObserver> report;
     Option<TotalTimeout>      total_timeout;
+    RequestCookies            cookies;
     auto                      clone() const -> ExecuteOptions {
         return { transfer,
                  policy.is_some() ? Some(policy->clone()) : None<ExecutionPolicy>(),
-                 routing.clone(),
+                 routing.is_some() ? Some(routing->clone()) : None<Routing>(),
                  partition.clone(),
                  report.is_some() ? Some(report->clone()) : None<ExecutionObserver>(),
-                 total_timeout };
+                 total_timeout,
+                 cookies.clone() };
     }
 };
 struct ClientConfig {
-    ExecutionPolicy      policy;
-    Option<StoreBinding> cache;
-    StoreFailure         store_failure { StoreFailure::Bypass };
-    Option<Duration>     total_timeout { Some(Duration::from_secs(u64(30))) };
-    usize                drain_limit { 65536 };
-    Duration             drain_timeout { Duration::from_secs(u64(1)) };
-    auto                 validate() const -> Result<empty>;
-    auto                 clone() const -> ClientConfig {
-        return { policy.clone(), cache.is_some() ? Some(cache->clone()) : None<StoreBinding>(),
-                 store_failure,  total_timeout,
-                 drain_limit,    drain_timeout };
+    ExecutionPolicy       policy;
+    Option<StoreBinding>  cache;
+    StoreFailure          store_failure { StoreFailure::Bypass };
+    Option<Duration>      total_timeout { Some(Duration::from_secs(u64(30))) };
+    usize                 drain_limit { 65536 };
+    Duration              drain_timeout { Duration::from_secs(u64(1)) };
+    Option<CookieBinding> cookies;
+    Routing               routing;
+    auto                  validate() const -> Result<empty>;
+    auto                  clone() const -> ClientConfig {
+        return { policy.clone(),
+                 cache.is_some() ? Some(cache->clone()) : None<StoreBinding>(),
+                 store_failure,
+                 total_timeout,
+                 drain_limit,
+                 drain_timeout,
+                 cookies.is_some() ? Some(cookies->clone()) : None<CookieBinding>(),
+                 routing.clone() };
     }
 };
 struct ClientState;
@@ -240,8 +242,16 @@ public:
         -> Result<Client>;
     auto clone() const -> Client;
     auto policy() const -> ExecutionPolicy;
+    auto capabilities() const -> BackendCapabilities;
+    auto resources() const -> ResourceContext;
+    auto prepare_connection(DuplexRequest, DuplexOptions = {}) const
+        -> rstd::Result<ConnectionPlan, Rejected<DuplexRequest>>;
     auto execute(ExecutionRequest request, ExecuteOptions options = {}) const
         -> rstd::Result<Transfer<ResponseMessage>, Rejected<ExecutionRequest>>;
+    auto duplex(DuplexRequest request, DuplexOptions options = {}) const
+        -> rstd::Result<PendingDuplex, Rejected<DuplexRequest>>;
+    auto upgrade(UpgradeRequest request, UpgradeOptions options = {}) const
+        -> rstd::Result<PendingUpgrade, Rejected<UpgradeRequest>>;
     void request_close() const;
     auto close() const -> coro<CloseReport>;
 };

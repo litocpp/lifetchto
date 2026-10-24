@@ -327,6 +327,35 @@ TEST(TransferCore, ByteQueueBoundsBackpressureAndReleasesQuota) {
     };
     runtime.block_on(task());
 }
+TEST(TransferCore, ByteQueueTryReadPreservesPendingEofAndSingleReader) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto task    = [&]() -> coro<empty> {
+        auto engine = lf::Engine::make(runtime.handle()).unwrap();
+        auto queue  = (co_await lf::ByteQueue::make(engine.resources(), usize(4))).unwrap();
+        EXPECT_TRUE(queue.try_next().unwrap().is_none());
+        EXPECT_TRUE(queue.try_next(usize()).unwrap_err().is_InvalidOptions());
+        EXPECT_TRUE(queue.try_send(lf::Bytes::copy_from_slice("1234"_str.as_bytes())).is_ok());
+        EXPECT_EQ((**queue.try_next(usize(2)).unwrap()).as_slice(), "12"_str.as_bytes());
+        EXPECT_EQ(queue.available(), usize(2));
+        queue.finish();
+        EXPECT_EQ((**queue.try_next().unwrap()).as_slice(), "34"_str.as_bytes());
+        EXPECT_TRUE(queue.try_next().unwrap()->is_none());
+        auto pending = (co_await lf::ByteQueue::make(engine.resources(), usize(4))).unwrap();
+        {
+            auto read   = pending.next().into_future();
+            auto polled = co_await rstd::async::select(
+                rstd::future::by_ref(read), rstd::async::sleep(Duration::from_millis(u64(1))));
+            EXPECT_TRUE(polled.is_right());
+            EXPECT_TRUE(pending.try_next().unwrap_err().is_Busy());
+        }
+        EXPECT_TRUE(pending.try_next().unwrap_err().is_Canceled());
+        pending.release();
+        queue.release();
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        co_return empty {};
+    };
+    runtime.block_on(task());
+}
 
 namespace
 {
@@ -568,4 +597,44 @@ TEST(TransferCore, RejectedResourceCloseCanResumeAndRunsOnlyOnce) {
         co_return empty {};
     };
     runtime.block_on(run());
+}
+TEST(TransferCore, ByteQueueObservationDoesNotConsumeOrCancelTheReader) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto task    = [&]() -> coro<empty> {
+        auto engine = lf::Engine::make(runtime.handle()).unwrap();
+        auto queue  = (co_await lf::ByteQueue::make(engine.resources(), usize(2))).unwrap();
+        EXPECT_FALSE(queue.readable().unwrap());
+        EXPECT_TRUE(
+            (co_await rstd::async::timeout(queue.wait_readable().into_future(), Duration {}))
+                .is_err());
+        EXPECT_FALSE(queue.readable().unwrap());
+        auto changed = queue.changed();
+        queue.try_send(lf::Bytes::copy_from_slice("ab"_str.as_bytes())).unwrap();
+        co_await rstd::move(changed);
+        EXPECT_TRUE((co_await queue.wait_readable()).is_ok());
+        EXPECT_TRUE(
+            (co_await rstd::async::timeout(queue.wait_writable().into_future(), Duration {}))
+                .is_err());
+        EXPECT_TRUE(queue.readable().unwrap());
+        auto readable = queue.try_next().unwrap();
+        EXPECT_EQ((**readable).as_slice(), "ab"_str.as_bytes());
+        EXPECT_TRUE((co_await queue.wait_writable()).is_ok());
+        queue.finish();
+        EXPECT_TRUE((co_await queue.wait_readable()).is_ok());
+        EXPECT_TRUE(queue.try_next().unwrap()->is_none());
+        EXPECT_TRUE((co_await queue.wait_writable()).unwrap_err().is_Closed());
+        queue.release();
+        auto failed = (co_await lf::ByteQueue::make(engine.resources(), usize(2))).unwrap();
+        failed.fail(lf::Error::TooLarge());
+        EXPECT_TRUE((co_await failed.wait_readable()).unwrap_err().is_TooLarge());
+        EXPECT_TRUE((co_await failed.wait_writable()).unwrap_err().is_TooLarge());
+        failed.release();
+        auto canceled = (co_await lf::ByteQueue::make(engine.resources(), usize(2))).unwrap();
+        engine.request_close();
+        EXPECT_TRUE((co_await canceled.wait_readable()).unwrap_err().is_Canceled());
+        canceled.release();
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        co_return empty {};
+    };
+    runtime.block_on(task());
 }

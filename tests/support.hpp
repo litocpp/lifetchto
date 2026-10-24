@@ -103,7 +103,7 @@ public:
     auto clone()const->TestClient{return TestClient(state_.clone());}
     auto send(TestRequest request,ExchangeOptions options={})const->coro<lifetchto::Result<TestResponse>>{
         auto deadline=options.deadline;if(state_->timeout.is_some()){auto own=Instant::now()+*state_->timeout;if(deadline.is_none()||own<*deadline)deadline=Some(own);}
-        lifetchto::http::ExecuteOptions execute;execute.transfer.deadline=deadline;execute.routing.route=options.route.clone();
+        lifetchto::http::ExecuteOptions execute;execute.transfer.deadline=deadline;execute.routing=Some(lifetchto::http::Routing{.route=options.route.clone()});
         auto submitted=state_->client.execute(rstd::move(request).into_message(),rstd::move(execute));if(submitted.is_err())return test_rejected(rstd::move(submitted).unwrap_err());return test_response(state_->engine.clone(),rstd::move(submitted).unwrap(),deadline);
     }
     auto exchange(TestRequest request,ExchangeOptions options={})const->coro<lifetchto::Result<TestResponse>>{return send(rstd::move(request),rstd::move(options));}

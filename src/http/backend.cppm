@@ -3,7 +3,9 @@ module;
 export module lifetchto.http:backend;
 export import :request;
 export import :response;
+export import :duplex;
 using namespace rstd::prelude;
+using namespace rstd::literals;
 export namespace lifetchto::http
 {
 class BackendIdentity {
@@ -18,10 +20,6 @@ public:
     auto matches(const BackendIdentity& other) const -> bool {
         return Arc<empty>::ptr_eq(token_, other.token_);
     }
-};
-struct RouteChoice {
-    Option<Arc<Route>> route;
-    auto               clone() const -> RouteChoice { return { route.clone() }; }
 };
 struct CacheScope {
     BackendIdentity backend;
@@ -40,6 +38,7 @@ class PreparedExchange {
     UploadMetadata            upload_;
     RouteChoice               route_;
     CacheScope                cache_;
+    Option<ProxyEndpoint>     proxy_;
 #if LITO_FEAT_HTTP2
     Option<lihttpto::h2::Request> http2_;
 #endif
@@ -77,9 +76,12 @@ public:
     auto upload() const -> const UploadMetadata& { return upload_; }
     auto target() const -> const RouteChoice& { return route_; }
     auto cache_scope() const -> const CacheScope& { return cache_; }
+    auto proxy() const -> const Option<ProxyEndpoint>& { return proxy_; }
+    void set_proxy(Option<ProxyEndpoint> proxy) { proxy_ = rstd::move(proxy); }
     auto clone() const -> PreparedExchange {
         auto copy = PreparedExchange(
             request_.clone(), backend_.clone(), upload_.clone(), route_.clone(), cache_.clone());
+        if (proxy_.is_some()) copy.proxy_ = Some(proxy_->clone());
 #if LITO_FEAT_HTTP2
         if (http2_.is_some()) copy.http2_ = Some(http2_->clone());
 #endif
@@ -89,6 +91,42 @@ public:
 struct ExchangeInput {
     PreparedExchange prepared;
     UploadBody       body;
+};
+struct BackendCapabilities {
+    bool            http1 {}, http2 {}, https {}, unix_socket {}, explicit_routes {};
+    bool            unknown_upload_length {}, upload_trailers {}, response_trailers {};
+    bool            repeated_request_fields {}, response_version {}, expect_continue {};
+    bool            duplex {}, half_close {};
+    TcpCapabilities tcp;
+    bool tls_custom_ca {}, tls_identity {}, tls_verification {}, low_speed {}, connect_timeout {};
+    ProxyCapabilities proxy;
+    auto              validate(const lihttpto::RequestParts& parts,
+                               const UploadMetadata&         upload,
+                               const RouteChoice&            route = {}) const -> Result<empty> {
+        if (parts.url.scheme() == Some("https"_str) && ! https)
+            return Err(Error::Unsupported("backend does not support HTTPS"_Str));
+        if (upload.length.is_none() && ! unknown_upload_length)
+            return Err(Error::Unsupported("backend requires a declared upload length"_Str));
+        if (upload.trailers.is_some() && ! upload_trailers)
+            return Err(Error::Unsupported("backend does not support upload trailers"_Str));
+        if (parts.headers.contains("expect"_str) && ! expect_continue)
+            return Err(Error::Unsupported(
+                "backend does not provide controlled Expect/Continue uploads"_Str));
+        if (! repeated_request_fields) {
+            for (const auto& field : parts.headers)
+                if (parts.headers.get_all(field.name.as_str()).len() > usize(1))
+                    return Err(Error::Unsupported(
+                        "backend does not preserve repeated request fields"_Str));
+        }
+        if (route.route.is_some()) {
+            if ((*route.route)->unix_path().is_some() && ! unix_socket)
+                return Err(Error::Unsupported("backend does not support Unix socket routes"_Str));
+            if ((*route.route)->unix_path().is_none() && ! explicit_routes)
+                return Err(
+                    Error::Unsupported("backend does not support explicit address routes"_Str));
+        }
+        return Ok(empty {});
+    }
 };
 struct ExchangeBackend {
     template<class Self, class = void>
@@ -105,9 +143,19 @@ struct ExchangeBackend {
         }
         void request_close() const { rstd::trait_call<2>(this); }
         auto close() const -> coro<Result<empty>> { return rstd::trait_call<3>(this); }
+        auto capabilities() const -> BackendCapabilities { return rstd::trait_call<4>(this); }
+        auto duplex(DuplexRequest input) const
+            -> rstd::Result<PreparedOperation<DuplexStream>, Rejected<DuplexRequest>> {
+            return rstd::trait_call<5>(this, rstd::move(input));
+        }
     };
     template<class T>
-    using Funcs = rstd::TraitFuncs<&T::prepare, &T::operation, &T::request_close, &T::close>;
+    using Funcs = rstd::TraitFuncs<&T::prepare,
+                                   &T::operation,
+                                   &T::request_close,
+                                   &T::close,
+                                   &T::capabilities,
+                                   &T::duplex>;
 };
 class BackendBinding {
     RSTD_ENUM(BackendBinding,
@@ -140,6 +188,9 @@ public:
     auto operation(ExchangeInput input) const
         -> rstd::Result<PreparedOperation<ResponseMessage>, Rejected<ExchangeInput>>;
     auto backend() const -> Arc<rstd::dyn<ExchangeBackend>>;
+    auto capabilities() const -> BackendCapabilities;
+    auto duplex(DuplexRequest input) const
+        -> rstd::Result<PreparedOperation<DuplexStream>, Rejected<DuplexRequest>>;
     void request_close() const;
     auto close() const -> coro<Result<empty>>;
 };
@@ -159,5 +210,9 @@ struct Impl<lifetchto::http::ExchangeBackend, lifetchto::http::NativeBackend>
     }
     void request_close() const { this->self().request_close(); }
     auto close() const { return this->self().close(); }
+    auto capabilities() const { return this->self().capabilities(); }
+    auto duplex(lifetchto::http::DuplexRequest input) const {
+        return this->self().duplex(rstd::move(input));
+    }
 };
 } // namespace rstd

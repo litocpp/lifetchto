@@ -43,6 +43,10 @@ public:
     auto unix_path() const -> const Option<rstd::bytes::Bytes>& { return unix_; }
     auto generation() const -> u64 { return generation_; }
 };
+struct RouteChoice {
+    Option<Arc<Route>> route;
+    auto               clone() const -> RouteChoice { return { route.clone() }; }
+};
 struct Resolver {
     template<class Self, class = void>
     struct Api {

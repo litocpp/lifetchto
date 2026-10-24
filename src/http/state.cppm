@@ -77,21 +77,40 @@ struct SlotFields {
 struct Slot {
     String                        origin;
     Option<Arc<Route>>            route;
+    Option<ProxyEndpoint>         proxy;
     rstd::sync::Mutex<SlotFields> fields { SlotFields {} };
     Event                         changed;
     Option<TaskControl>           task;
     Option<ResourcePermit>        permit;
     rstd::async::Mutex<empty>     join_gate { empty {} };
-    Slot(String origin, Option<Arc<Route>> route)
-        : origin(rstd::move(origin)), route(rstd::move(route)) {}
+    Slot(String origin, Option<Arc<Route>> route, Option<ProxyEndpoint> proxy = {})
+        : origin(rstd::move(origin)), route(rstd::move(route)), proxy(rstd::move(proxy)) {}
+};
+struct NativeDuplexRegistration {
+    rstd::sync::Weak<ResourceLease<empty>> lease;
+    Arc<rstd::sync::atomic::Atomic<bool>>  native_done;
 };
 struct NativeFields {
-    Vec<Arc<Slot>> slots;
-    Vec<Arc<Slot>> retired;
-    usize          waiters {}, handles { 1 };
-    bool           closed {};
-    Option<Error>  close_error;
+    Vec<Arc<Slot>>                slots;
+    Vec<Arc<Slot>>                retired;
+    Vec<NativeDuplexRegistration> duplex;
+    usize                         waiters {}, handles { 1 };
+    bool                          closed {};
+    Option<Error>                 close_error;
 };
+auto active_duplex(NativeFields& fields) -> usize {
+    usize count {};
+    for (usize i {}; i < fields.duplex.len();) {
+        auto lease = fields.duplex[i].lease.upgrade();
+        if (! lease || lease->is_released()) {
+            fields.duplex.remove(i);
+            continue;
+        }
+        if (! fields.duplex[i].native_done->load()) ++count;
+        ++i;
+    }
+    return count;
+}
 struct NativeState {
     rstd::async::RuntimeHandle      runtime;
     EngineHandle                    resources;

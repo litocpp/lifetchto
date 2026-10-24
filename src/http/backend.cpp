@@ -1,8 +1,11 @@
+module;
+#include <rstd/macro.hpp>
 module lifetchto.http;
 import :backend;
 import :state;
 import :driver;
 import :native_body;
+import :duplex_native;
 using namespace rstd::prelude;
 using namespace rstd::literals;
 namespace lifetchto::http
@@ -13,6 +16,10 @@ void stop_client(const Arc<NativeState>& state) {
         auto f     = state->fields.lock().unwrap();
         f->closed  = true;
         f->waiters = usize();
+        for (const auto& item : f->duplex) {
+            auto lease = item.lease.upgrade();
+            if (lease) lease->request_stop();
+        }
         for (const auto& slot : f->slots) {
             {
                 auto s     = slot->fields.lock().unwrap();
@@ -163,7 +170,8 @@ auto perform_exchange(Arc<AttemptData> attempt, TransferContext context)
                 (*selected)->fields.lock().unwrap()->idle = false;
             }
             if (selected.is_none() && ! returning &&
-                f->slots.len() + f->retired.len() < state->options.max_connections &&
+                f->slots.len() + f->retired.len() + active_duplex(*f) <
+                    state->options.max_connections &&
                 same < state->options.max_connections_per_origin) {
                 auto quota = resources->try_reserve(ResourceAmount {
                     .resources = usize(1),
@@ -171,7 +179,9 @@ auto perform_exchange(Arc<AttemptData> attempt, TransferContext context)
                                  state->options.head_limit });
                 auto slot =
                     Arc<Slot>::make(identity.clone(),
-                                    route.is_some() ? Some((*route).clone()) : None<Arc<Route>>());
+                                    route.is_some() ? Some((*route).clone()) : None<Arc<Route>>(),
+                                    prepared.proxy().is_some() ? Some(prepared.proxy()->clone())
+                                                               : None<ProxyEndpoint>());
                 if (quota.is_err()) co_return Err(rstd::move(quota).unwrap_err());
                 slot->permit = Some(rstd::move(quota).unwrap());
                 f->slots.push(slot.clone());
@@ -315,11 +325,23 @@ auto join_slot(Arc<Slot> slot) -> coro<Result<empty>> {
 }
 auto close_client(Arc<NativeState> state) -> coro<Result<empty>> {
     stop_client(state);
-    Vec<Arc<Slot>> slots;
+    Vec<Arc<Slot>>                 slots;
+    Vec<Arc<ResourceLease<empty>>> duplex;
     {
         auto f = state->fields.lock().unwrap();
         for (const auto& slot : f->slots) slots.push(slot.clone());
         for (const auto& slot : f->retired) slots.push(slot.clone());
+        for (const auto& item : f->duplex) {
+            auto lease = item.lease.upgrade();
+            if (lease) duplex.push(rstd::move(lease));
+        }
+    }
+    for (const auto& lease : duplex) {
+        auto result = co_await lease->release();
+        if (result.is_err()) {
+            auto f = state->fields.lock().unwrap();
+            if (f->close_error.is_none()) f->close_error = Some(rstd::move(result).unwrap_err());
+        }
     }
     for (auto& slot : slots) {
         auto result = co_await join_slot(slot.clone());
@@ -461,6 +483,15 @@ auto NativeAttempt::run(TransferContext context, OutputSender<ResponseMessage> o
         if (published.is_err()) data->body->cancel();
     } else
         data->body->cancel();
+    // Native exit can precede consumption of buffered response data.
+    for (;;) {
+        auto event = data->body->changed.listen();
+        {
+            auto f = data->body->fields.lock().unwrap();
+            if (f->consumed || f->canceled || f->error.is_some()) break;
+        }
+        co_await rstd::move(event);
+    }
     (void)co_await wait_body_release(data->body.clone());
     auto f = data->body->fields.lock().unwrap();
     context.progress(Some(f->accepted_bytes),
@@ -502,6 +533,14 @@ auto NativeBackend::clone() const -> NativeBackend {
 }
 auto NativeBackend::make(ResourceContext resources, TransportOptions options)
     -> Result<NativeBackend> {
+    auto proxy = options.proxy.validate({ .http = true, .system_snapshot = true });
+    if (proxy.is_err()) return Err(rstd::move(proxy).unwrap_err());
+    auto tcp =
+        options.tcp.validate({ true, true, rstd::net::TcpStream::keepalive_timing_supported() });
+    if (tcp.is_err()) return Err(rstd::move(tcp).unwrap_err());
+    if (options.low_speed.is_some())
+        return Err(
+            Error::Unsupported("native backend does not implement a low-speed rate policy"_Str));
     if (options.max_connections == usize() || options.max_connections_per_origin == usize() ||
         options.receive_window == usize() || options.upload_window == usize() ||
         options.head_limit < usize(16) || options.max_informational == usize() ||
@@ -539,11 +578,24 @@ auto NativeBackend::prepare(lihttpto::RequestParts parts,
 #endif
     if (route.route.is_some() && (*route.route)->origin() != origin->serialize().as_str())
         return Err(Error::InvalidOptions(String::make("route belongs to a different origin"_str)));
-    auto prepared = lihttpto::PreparedRequest::make(
+    if (route.route.is_some() && state_->options.proxy.enabled())
+        return Err(Error::Unsupported("explicit routes require a disabled proxy profile"_Str));
+    if (route.route.is_some() && (*route.route)->unix_path().is_some() &&
+        state_->options.tcp.specified())
+        return Err(Error::Unsupported("TCP options cannot be applied to Unix sockets"_Str));
+    auto proxy = state_->options.proxy.select(parts.url);
+    if (proxy.is_err()) return Err(rstd::move(proxy).unwrap_err());
+    if (proxy->is_some() && route.route.is_some())
+        return Err(Error::InvalidOptions("proxy conflicts with an explicit route"_Str));
+    auto target_form = proxy->is_some() && origin->scheme == "http"_str
+                           ? lihttpto::TargetForm::Absolute
+                           : lihttpto::TargetForm::Origin;
+    auto prepared    = lihttpto::PreparedRequest::make(
         rstd::move(parts),
         upload.length,
         state_->options.head_limit,
-        upload.trailers.is_some() ? rstd::addressof(*upload.trailers) : nullptr);
+        upload.trailers.is_some() ? rstd::addressof(*upload.trailers) : nullptr,
+        target_form);
     if (prepared.is_err())
         return Err(Error::InvalidOptions(String::make("invalid HTTP request metadata"_str)));
     auto identity = state_->identity.clone();
@@ -553,6 +605,7 @@ auto NativeBackend::prepare(lihttpto::RequestParts parts,
                                            rstd::move(upload),
                                            rstd::move(route),
                                            rstd::move(cache));
+    result.set_proxy(rstd::move(proxy).unwrap());
 #if LITO_FEAT_HTTP2 && LITO_FEAT_TLS
     if (origin->scheme.as_str() == "https"_str &&
         state_->options.tls->version_policy() != VersionPolicy::Http1) {
@@ -578,6 +631,35 @@ auto NativeBackend::operation(ExchangeInput input) const
 }
 auto NativeBackend::backend() const -> Arc<rstd::dyn<ExchangeBackend>> {
     return Arc<rstd::dyn<ExchangeBackend>>::make(clone());
+}
+auto NativeBackend::capabilities() const -> BackendCapabilities {
+    return { .http1 = true,
+#if LITO_FEAT_HTTP2 && LITO_FEAT_TLS
+             .http2 = state_->options.tls->version_policy() != VersionPolicy::Http1,
+#endif
+#if LITO_FEAT_TLS
+             .https = true,
+#endif
+#if RSTD_OS_UNIX
+             .unix_socket = ! state_->options.proxy.enabled() && ! state_->options.tcp.specified(),
+#endif
+             .explicit_routes         = ! state_->options.proxy.enabled(),
+             .unknown_upload_length   = true,
+             .upload_trailers         = true,
+             .response_trailers       = true,
+             .repeated_request_fields = true,
+             .response_version        = true,
+             .expect_continue         = true,
+             .duplex                  = true,
+             .half_close              = true,
+             .tcp = { true, true, rstd::net::TcpStream::keepalive_timing_supported() },
+#if LITO_FEAT_TLS
+             .tls_custom_ca    = true,
+             .tls_identity     = true,
+             .tls_verification = true,
+#endif
+             .connect_timeout = true,
+             .proxy           = { .http = true, .system_snapshot = true } };
 }
 void NativeBackend::request_close() const {
     stop_client(state_);
