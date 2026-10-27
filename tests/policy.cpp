@@ -19,22 +19,24 @@ auto request(ref<str> path = "http://example.test/item"_str, ref<str> method = "
     };
 }
 struct Reply {
-    u16               status { 200 };
-    lihttpto::Headers headers;
-    Bytes             data { Bytes::copy_from_slice("payload"_str.as_bytes()) };
-    bool              connect_error {}, source_error {};
-    lf::RemoteOutcome remote { lf::RemoteOutcome::Confirmed };
+    u16                 status { 200 };
+    lihttpto::Headers   headers;
+    Bytes               data { Bytes::copy_from_slice("payload"_str.as_bytes()) };
+    bool                connect_error {}, source_error {};
+    lf::RemoteOutcome   remote { lf::RemoteOutcome::Confirmed };
+    h::CacheObservation cache;
 };
 struct Seen {
     lihttpto::RequestParts    parts;
     Bytes                     body;
     Option<lihttpto::Headers> trailers;
+    h::CacheDirective         directive { h::CacheDirective::Disabled };
 };
 struct Scenario {
     Vec<Reply> replies;
     Vec<Seen>  seen;
     usize      prepared {}, selected {}, closes {};
-    bool       closed {};
+    bool       closed {}, native_cache {};
 };
 using Script = Arc<rstd::sync::Mutex<Scenario>>;
 struct Cursor {
@@ -82,8 +84,10 @@ struct Exchange {
 struct Backend {
     Script             script;
     h::BackendIdentity id;
-    auto prepare(lihttpto::RequestParts parts, h::UploadMetadata upload, h::RouteChoice route) const
-        -> lf::Result<h::PreparedExchange> {
+    auto prepare(lihttpto::RequestParts parts,
+                 h::UploadMetadata      upload,
+                 h::RouteChoice         route,
+                 h::CacheDirective      directive) const -> lf::Result<h::PreparedExchange> {
         {
             auto f = script->lock().unwrap();
             ++f->prepared;
@@ -101,7 +105,8 @@ struct Backend {
                                             id.clone(),
                                             rstd::move(upload),
                                             rstd::move(route),
-                                            rstd::move(scope)));
+                                            rstd::move(scope),
+                                            directive));
     }
     auto operation(h::ExchangeInput input) const
         -> rstd::Result<lf::PreparedOperation<h::ResponseMessage>, lf::Rejected<h::ExchangeInput>> {
@@ -180,17 +185,28 @@ struct Impl<h::ExchangeBackend, Backend> : ImplBase<Backend> {
             rstd::move(input) });
     }
     auto capabilities() const -> h::BackendCapabilities {
-        return { .http1                   = true,
-                 .https                   = true,
-                 .explicit_routes         = true,
-                 .unknown_upload_length   = true,
-                 .upload_trailers         = true,
-                 .response_trailers       = true,
-                 .repeated_request_fields = true,
-                 .expect_continue         = true };
+        auto caps = h::BackendCapabilities { .http1                   = true,
+                                             .https                   = true,
+                                             .explicit_routes         = true,
+                                             .unknown_upload_length   = true,
+                                             .upload_trailers         = true,
+                                             .response_trailers       = true,
+                                             .repeated_request_fields = true,
+                                             .expect_continue         = true };
+        if (this->self().script->lock().unwrap()->native_cache)
+            caps.cache = { .provider            = h::CacheProvider::Backend,
+                           .configured          = true,
+                           .default_mode        = true,
+                           .isolation           = h::CacheIsolation::Manager,
+                           .network_observation = false,
+                           .commit              = h::CacheCommit::BackendCompletion };
+        return caps;
     }
-    auto prepare(lihttpto::RequestParts p, h::UploadMetadata u, h::RouteChoice r) const {
-        return this->self().prepare(rstd::move(p), rstd::move(u), rstd::move(r));
+    auto prepare(lihttpto::RequestParts p,
+                 h::UploadMetadata      u,
+                 h::RouteChoice         r,
+                 h::CacheDirective      directive) const {
+        return this->self().prepare(rstd::move(p), rstd::move(u), rstd::move(r), directive);
     }
     auto operation(h::ExchangeInput i) const { return this->self().operation(rstd::move(i)); }
     void request_close() const { this->self().request_close(); }
@@ -251,7 +267,8 @@ auto Exchange::run(lf::TransferContext context, lf::OutputSender<h::ResponseMess
         auto index = f->seen.len();
         f->seen.push({ input.prepared.parts().clone(),
                        Bytes::copy_from_slice(uploaded.as_slice()),
-                       input.body.trailers().clone() });
+                       input.body.trailers().clone(),
+                       input.prepared.cache_directive() });
         if (index < f->replies.len()) reply = rstd::move(f->replies[index]);
     }
     if (reply.connect_error)
@@ -271,7 +288,8 @@ auto Exchange::run(lf::TransferContext context, lf::OutputSender<h::ResponseMess
     }
     auto sent = output.publish(
         { { lihttpto::StatusCode::make(reply.status).unwrap(), rstd::move(reply.headers), {}, {} },
-          rstd::move(body) });
+          rstd::move(body),
+          reply.cache });
     if (sent.is_err()) control.cancel();
     auto done = co_await control.wait();
     co_return lf::ProtocolCompletion { rstd::move(done), reply.remote };
@@ -525,8 +543,8 @@ TEST(HttpPolicy, SharedBindingsSurviveSiblingCloseAndOwnedBindingCloses) {
         auto            backend = binding(script.clone()).backend();
         auto            cache   = h::MemoryCache::make(engine.resources()).unwrap();
         h::ClientConfig aconfig, bconfig;
-        aconfig.cache = Some(h::StoreBinding::Shared(cache.store()));
-        bconfig.cache = Some(h::StoreBinding::Shared(cache.store()));
+        aconfig.cache = Some(h::CacheBinding::Store(h::StoreBinding::Shared(cache.store())));
+        bconfig.cache = Some(h::CacheBinding::Store(h::StoreBinding::Shared(cache.store())));
         auto a        = h::Client::make(engine.handle(),
                                         h::BackendBinding::Shared(backend.clone()),
                                         rstd::move(aconfig))
@@ -569,7 +587,7 @@ TEST(HttpCache, PublicStoreCachesAndPartitionsAndAbortsTruncatedBodies) {
             Arc<rstd::dyn<h::CacheStore>>::make(ForwardStore { cache.store(), lookups.clone() });
         h::ClientConfig config;
         config.policy.cache = h::CacheMode::Default;
-        config.cache        = Some(h::StoreBinding::Shared(store.clone()));
+        config.cache        = Some(h::CacheBinding::Store(h::StoreBinding::Shared(store.clone())));
         auto client =
             h::Client::make(engine.handle(), binding(script.clone()), rstd::move(config)).unwrap();
         for (int i = 0; i < 4; ++i) {
@@ -744,14 +762,26 @@ TEST(PolicyPeer, LastModifiedVaryInvalidationAndOversizeCaching) {
         auto            cache = h::MemoryCache::make(engine.resources(), sizes).unwrap();
         h::ClientConfig config;
         config.policy.cache = h::CacheMode::Default;
-        config.cache        = Some(h::StoreBinding::Shared(cache.store()));
+        config.cache        = Some(h::CacheBinding::Store(h::StoreBinding::Shared(cache.store())));
         auto client         = h::Client::make(engine.handle(),
                                               h::BackendBinding::Shared(backend.backend()),
                                               rstd::move(config))
                                   .unwrap();
         for (int i = 0; i < 3; ++i) {
-            auto transfer = client.execute(request(peer_url("/policy-date"_str).as_str())).unwrap();
+            h::ExecutionObserver observer;
+            h::ExecuteOptions    options;
+            options.report = Some(observer.clone());
+            auto transfer =
+                client.execute(request(peer_url("/policy-date"_str).as_str()), rstd::move(options))
+                    .unwrap();
             EXPECT_EQ((co_await finish(transfer)).unwrap().as_slice(), "hello"_str.as_bytes());
+            auto report = (co_await observer.wait()).unwrap();
+            EXPECT_EQ(report.facts.from_cache, i > 0);
+            EXPECT_EQ(report.facts.cache.network,
+                      i < 2 ? h::NetworkAccess::Confirmed : h::NetworkAccess::None);
+            EXPECT_EQ(report.transfer->logical.remote,
+                      i < 2 ? lf::RemoteOutcome::Confirmed : lf::RemoteOutcome::NotApplicable);
+            if (i == 1) EXPECT_EQ(report.facts.cache.validation, h::CacheValidation::Confirmed);
         }
         for (int i = 0; i < 3; ++i) {
             auto req = request(peer_url("/policy-vary"_str).as_str());
@@ -995,4 +1025,154 @@ TEST(HttpPolicy, ConnectionPreparationReusesDefaultRouteAndAbsoluteDeadline) {
         co_return empty {};
     };
     runtime.block_on(run());
+}
+
+TEST(HttpCache, NativeBindingAndUnsupportedRequestsPreserveInput) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto task    = [&]() -> coro<empty> {
+        auto engine  = lf::Engine::make(runtime.handle()).unwrap();
+        auto script  = Script::make(Scenario {});
+        auto backend = Arc<rstd::dyn<h::ExchangeBackend>>::make(Backend { script.clone(), {} });
+        h::ClientConfig config;
+        config.cache        = Some(h::CacheBinding::Backend());
+        config.policy.cache = h::CacheMode::Default;
+        auto missing        = h::Client::make(
+            engine.handle(), h::BackendBinding::Shared(backend.clone()), config.clone());
+        EXPECT_TRUE(missing.is_err() && missing.as_ref().unwrap_err().is_Unsupported());
+        script->lock().unwrap()->native_cache = true;
+        auto client = h::Client::make(engine.handle(),
+                                      h::BackendBinding::Shared(backend.clone()),
+                                      config.clone())
+                          .unwrap();
+        EXPECT_EQ(client.cache_capabilities().provider, h::CacheProvider::Backend);
+        auto opens = Arc<rstd::sync::Mutex<usize>>::make(usize());
+        for (auto mode :
+             array<h::CacheMode, 2> { h::CacheMode::Revalidate, h::CacheMode::OnlyIfCached }) {
+            auto input = request();
+            input.body = h::UploadPlan::repeatable(
+                { Some(u64(3)) },
+                Arc<rstd::dyn<lf::UploadFactory>>::make(Factory { opens.clone() }));
+            h::ExecuteOptions options;
+            options.policy        = Some(h::ExecutionPolicy {});
+            options.policy->cache = mode;
+            auto rejected         = client.execute(rstd::move(input), rstd::move(options));
+            EXPECT_TRUE(rejected.is_err());
+            auto original = rstd::move(rejected).unwrap_err();
+            EXPECT_TRUE(original.error.is_Unsupported());
+            EXPECT_EQ(original.input.parts.url.as_ref(), "http://example.test/item"_str);
+            EXPECT_TRUE(original.input.body.replayable());
+            EXPECT_TRUE((co_await original.input.body.close()).is_ok());
+        }
+        h::ExecuteOptions options;
+        options.partition = "account"_Str;
+        EXPECT_TRUE(client.execute(request(), rstd::move(options)).is_err());
+        config.store_failure = h::StoreFailure::Fail;
+        EXPECT_TRUE(h::Client::make(engine.handle(),
+                                    h::BackendBinding::Shared(backend.clone()),
+                                    rstd::move(config))
+                        .is_err());
+        EXPECT_EQ(*opens->lock().unwrap(), usize());
+        EXPECT_EQ(script->lock().unwrap()->prepared, usize());
+        EXPECT_EQ(script->lock().unwrap()->seen.len(), usize());
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        co_return empty {};
+    };
+    runtime.block_on(task());
+}
+TEST(HttpCache, NativeDirectiveSurvivesRetryAndReportsBodyOrigin) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto task    = [&]() -> coro<empty> {
+        auto engine = lf::Engine::make(runtime.handle()).unwrap();
+        auto script = Script::make(Scenario {});
+        {
+            auto f          = script->lock().unwrap();
+            f->native_cache = true;
+            Reply retry;
+            retry.status = u16(503);
+            f->replies.push(rstd::move(retry));
+            Reply hit;
+            hit.cache  = { h::CacheOrigin::BackendCache, h::NetworkAccess::Unknown };
+            hit.remote = lf::RemoteOutcome::Unknown;
+            f->replies.push(rstd::move(hit));
+        }
+        h::ClientConfig config;
+        config.cache        = Some(h::CacheBinding::Backend());
+        config.policy.cache = h::CacheMode::Default;
+        h::RetryPolicy retry;
+        retry.methods.push("GET"_Str);
+        retry.statuses.push(u16(503));
+        retry.backoff       = lf::Duration {};
+        config.policy.retry = Some(rstd::move(retry));
+        auto client =
+            h::Client::make(engine.handle(),
+                            h::BackendBinding::Shared(Arc<rstd::dyn<h::ExchangeBackend>>::make(
+                                Backend { script.clone(), {} })),
+                            rstd::move(config))
+                .unwrap();
+        h::ExecutionObserver observer;
+        h::ExecuteOptions    options;
+        options.report = Some(observer.clone());
+        auto transfer  = client.execute(request(), rstd::move(options)).unwrap();
+        EXPECT_TRUE((co_await finish(transfer)).is_ok());
+        auto report = (co_await observer.wait()).unwrap();
+        EXPECT_TRUE(report.facts.from_cache);
+        EXPECT_EQ(report.facts.cache.origin, h::CacheOrigin::BackendCache);
+        EXPECT_EQ(report.facts.cache.network, h::NetworkAccess::Unknown);
+        EXPECT_EQ(report.transfer->logical.remote, lf::RemoteOutcome::Unknown);
+        EXPECT_EQ(report.facts.attempts, usize(2));
+        {
+            auto f = script->lock().unwrap();
+            EXPECT_EQ(f->prepared, usize(1));
+            EXPECT_EQ(f->seen.len(), usize(2));
+            for (const auto& seen : f->seen) {
+                EXPECT_EQ(seen.directive, h::CacheDirective::Default);
+                EXPECT_FALSE(seen.parts.headers.contains("if-none-match"_str));
+            }
+        }
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        co_return empty {};
+    };
+    runtime.block_on(task());
+}
+TEST(HttpCache, NativeChecksSelectedCookiesBeforePreparingOrOpeningUpload) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto task    = [&]() -> coro<empty> {
+        auto engine                           = lf::Engine::make(runtime.handle()).unwrap();
+        auto script                           = Script::make(Scenario {});
+        script->lock().unwrap()->native_cache = true;
+        auto jar                              = h::MemoryCookieJar::make().unwrap();
+        auto input                            = request();
+        auto opens                            = Arc<rstd::sync::Mutex<usize>>::make(usize());
+        input.body                            = h::UploadPlan::repeatable(
+            { Some(u64()) }, Arc<rstd::dyn<lf::UploadFactory>>::make(Factory { opens.clone() }));
+        jar.store(input.parts.url,
+                  lihttpto::SetCookie::parse("sid=one; Path=/"_str).unwrap(),
+                  h::cache_now())
+            .unwrap();
+        h::ClientConfig config;
+        config.cache        = Some(h::CacheBinding::Backend());
+        config.policy.cache = h::CacheMode::Default;
+        config.cookies      = Some(h::CookieBinding::Shared(jar.jar()));
+        auto client =
+            h::Client::make(engine.handle(),
+                            h::BackendBinding::Shared(Arc<rstd::dyn<h::ExchangeBackend>>::make(
+                                Backend { script.clone(), {} })),
+                            rstd::move(config))
+                .unwrap();
+        auto transfer = client.execute(rstd::move(input)).unwrap();
+        auto output   = co_await transfer.output();
+        EXPECT_TRUE(output.is_err() && output.as_ref().unwrap_err().is_Unsupported());
+        auto report = co_await transfer.control().wait();
+        EXPECT_EQ(report->logical.remote, lf::RemoteOutcome::NotDispatched);
+        EXPECT_EQ(*opens->lock().unwrap(), usize());
+        EXPECT_EQ(script->lock().unwrap()->prepared, usize());
+        EXPECT_EQ(script->lock().unwrap()->seen.len(), usize());
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await jar.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        co_return empty {};
+    };
+    runtime.block_on(task());
 }

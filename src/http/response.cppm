@@ -1,5 +1,5 @@
 export module lifetchto.http:response;
-export import :error;
+export import :cache_policy;
 using namespace rstd::prelude;
 namespace lifetchto::http
 {
@@ -73,5 +73,9 @@ public:
     }
     auto close() const -> coro<Result<empty>> { return completion().close(); }
 };
-export using ResponseMessage = lihttpto::ResponseMessage<ResponseBody>;
+export struct ResponseMessage {
+    lihttpto::ResponseHead head;
+    ResponseBody           body;
+    CacheObservation       cache;
+};
 } // namespace lifetchto::http

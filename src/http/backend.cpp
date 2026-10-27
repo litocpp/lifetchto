@@ -564,7 +564,10 @@ auto NativeBackend::make(ResourceContext resources, TransportOptions options)
 }
 auto NativeBackend::prepare(lihttpto::RequestParts parts,
                             UploadMetadata         upload,
-                            RouteChoice            route) const -> Result<PreparedExchange> {
+                            RouteChoice            route,
+                            CacheDirective         directive) const -> Result<PreparedExchange> {
+    if (directive != CacheDirective::Disabled)
+        return Err(Error::Unsupported("native backend has no native response cache"_Str));
     {
         auto f = state_->fields.lock().unwrap();
         if (f->closed) return Err(Error::Closed());
@@ -604,7 +607,8 @@ auto NativeBackend::prepare(lihttpto::RequestParts parts,
                                            rstd::move(identity),
                                            rstd::move(upload),
                                            rstd::move(route),
-                                           rstd::move(cache));
+                                           rstd::move(cache),
+                                           directive);
     result.set_proxy(rstd::move(proxy).unwrap());
 #if LITO_FEAT_HTTP2 && LITO_FEAT_TLS
     if (origin->scheme.as_str() == "https"_str &&
@@ -619,6 +623,9 @@ auto NativeBackend::prepare(lihttpto::RequestParts parts,
 }
 auto NativeBackend::operation(ExchangeInput input) const
     -> rstd::Result<PreparedOperation<ResponseMessage>, Rejected<ExchangeInput>> {
+    if (input.prepared.cache_directive() != CacheDirective::Disabled)
+        return Err(Rejected<ExchangeInput> {
+            Error::Unsupported("backend has no native response cache"_Str), rstd::move(input) });
     if (! input.prepared.backend_identity().matches(state_->identity))
         return Err(Rejected<ExchangeInput> {
             Error::InvalidOptions(String::make("prepared exchange belongs to another backend"_str)),

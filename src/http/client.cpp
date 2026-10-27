@@ -46,8 +46,9 @@ void stop_http_client(const Arc<ClientState>& state) {
     }
     state->scope.request_close();
     if (state->binding.is_Owned()) state->backend->request_close();
-    if (state->config.cache.is_some() && state->config.cache->is_Owned())
-        state->config.cache->store()->request_close();
+    if (state->config.cache.is_some() && state->config.cache->is_Store() &&
+        state->config.cache->as_Store().value.is_Owned())
+        state->config.cache->as_Store().value.store()->request_close();
     if (state->config.cookies.is_some() && state->config.cookies->is_Owned())
         state->config.cookies->jar()->request_close();
 }
@@ -67,8 +68,9 @@ auto finish_http_client(Arc<ClientState> state) -> coro<Result<empty>> {
         auto closed = co_await state->backend->close();
         if (closed.is_err()) report.add(rstd::move(closed).unwrap_err());
     }
-    if (state->config.cache.is_some() && state->config.cache->is_Owned()) {
-        auto closed = co_await state->config.cache->store()->close();
+    if (state->config.cache.is_some() && state->config.cache->is_Store() &&
+        state->config.cache->as_Store().value.is_Owned()) {
+        auto closed = co_await state->config.cache->as_Store().value.store()->close();
         if (closed.is_err()) report.add(rstd::move(closed).unwrap_err());
     }
     if (state->config.cookies.is_some() && state->config.cookies->is_Owned()) {
@@ -405,8 +407,7 @@ namespace lifetchto::http
 auto publish_response(const Arc<LogicalState>&      state,
                       TransferContext               context,
                       OutputSender<ResponseMessage> output,
-                      ResponseMessage               message,
-                      bool                          cached) -> coro<ProtocolCompletion> {
+                      ResponseMessage               message) -> coro<ProtocolCompletion> {
     auto control = message.body.completion();
     {
         auto f  = state->fields.lock().unwrap();
@@ -423,40 +424,50 @@ auto publish_response(const Arc<LogicalState>&      state,
     auto owner = rstd::move(registered).unwrap();
     {
         auto f                 = state->report->fields.lock().unwrap();
-        f->facts.from_cache    = cached;
+        f->facts.from_cache    = message.cache.from_cache();
+        f->facts.cache         = message.cache;
         f->facts.head_received = Some(Instant::now());
     }
+    auto remote    = message.cache.remote();
     auto published = output.publish(rstd::move(message));
     if (published.is_err()) control.cancel();
     auto completed = co_await control.wait();
-    co_return ProtocolCompletion { rstd::move(completed),
-                                   cached ? RemoteOutcome::NotApplicable
-                                          : RemoteOutcome::Confirmed };
+    co_return ProtocolCompletion { rstd::move(completed), remote };
 }
 auto cached_response(const Arc<LogicalState>&       state,
                      TransferContext                context,
                      OutputSender<ResponseMessage>  output,
                      CacheEntry                     entry,
                      Option<lihttpto::ResponseHead> changed = {}) -> coro<ProtocolCompletion> {
-    auto head = changed.is_some() ? changed.take().unwrap() : entry.metadata().head.clone();
-    auto age  = entry.metadata().policy.age(cache_now());
+    bool validated = changed.is_some();
+    auto head      = changed.is_some() ? changed.take().unwrap() : entry.metadata().head.clone();
+    auto age       = entry.metadata().policy.age(cache_now());
     head.headers.set("Age"_str, rstd::format("{}", age).as_str()).unwrap();
     auto body = co_await entry.open(context.clone());
     if (body.is_err())
         co_return ProtocolCompletion { Err(rstd::move(body).unwrap_err()),
-                                       RemoteOutcome::NotApplicable };
-    co_return co_await publish_response(state,
-                                        context.clone(),
-                                        rstd::move(output),
-                                        { rstd::move(head), rstd::move(body).unwrap() },
-                                        true);
+                                       validated ? RemoteOutcome::Confirmed
+                                                 : RemoteOutcome::NotApplicable };
+    co_return co_await publish_response(
+        state,
+        context.clone(),
+        rstd::move(output),
+        { rstd::move(head),
+          rstd::move(body).unwrap(),
+          { CacheOrigin::Store,
+            validated ? NetworkAccess::Confirmed : NetworkAccess::None,
+            validated ? CacheValidation::Confirmed : CacheValidation::NotPerformed } });
 }
 auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> output)
     -> coro<ProtocolCompletion> {
     auto                               client  = state->client.clone();
     auto                               backend = client->backend.clone();
     Option<Arc<rstd::dyn<CacheStore>>> store;
-    if (client->config.cache.is_some()) store = Some(client->config.cache->store());
+    if (client->config.cache.is_some() && client->config.cache->is_Store())
+        store = Some(client->config.cache->as_Store().value.store());
+    auto directive = client->config.cache.is_some() && client->config.cache->is_Backend()
+                         ? cache_directive(state->policy.cache)
+                         : CacheDirective::Disabled;
     Option<Arc<rstd::dyn<CookieJar>>> cookies;
     if (state->options.cookies.is_Shared())
         cookies = Some(state->options.cookies.as_Shared().value.clone());
@@ -501,12 +512,22 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
                                                    RemoteOutcome::NotDispatched };
                 route = rstd::move(selected).unwrap();
             }
-            auto prepared_result =
-                backend->prepare(request.parts.clone(), request.body.metadata(), rstd::move(route));
+            auto cache_supported = backend->capabilities().validate_cache(
+                directive, request.parts, request.body.metadata());
+            if (cache_supported.is_err())
+                co_return ProtocolCompletion { Err(rstd::move(cache_supported).unwrap_err()),
+                                               RemoteOutcome::NotDispatched };
+            auto prepared_result = backend->prepare(
+                request.parts.clone(), request.body.metadata(), rstd::move(route), directive);
             if (prepared_result.is_err())
                 co_return ProtocolCompletion { Err(rstd::move(prepared_result).unwrap_err()),
                                                RemoteOutcome::NotDispatched };
             auto prepared = rstd::move(prepared_result).unwrap();
+            if (prepared.cache_directive() != directive)
+                co_return ProtocolCompletion {
+                    Err(Error::Contract("backend changed the resolved cache directive"_Str)),
+                    RemoteOutcome::NotDispatched
+                };
             {
                 auto f             = state->report->fields.lock().unwrap();
                 f->facts.request   = Some(request.parts.clone());
@@ -564,7 +585,8 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
                 if (validate) {
                     auto updated = backend->prepare(rstd::move(conditional),
                                                     request.body.metadata(),
-                                                    prepared.target().clone());
+                                                    prepared.target().clone(),
+                                                    prepared.cache_directive());
                     if (updated.is_err())
                         co_return ProtocolCompletion { Err(rstd::move(updated).unwrap_err()),
                                                        RemoteOutcome::NotDispatched };
@@ -632,6 +654,7 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
         }
         auto message = rstd::move(response).unwrap();
         auto status  = message.head.status.value();
+        auto remote  = message.cache.remote();
         if (cookies.is_some()) {
             for (auto value : message.head.headers.get_all("set-cookie"_str)) {
                 auto parsed = lihttpto::SetCookie::parse_bytes(value->as_slice());
@@ -640,8 +663,7 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
                 if (stored.is_err()) {
                     message.body.cancel();
                     (void)co_await attempt_control.close();
-                    co_return ProtocolCompletion { Err(rstd::move(stored).unwrap_err()),
-                                                   RemoteOutcome::Confirmed };
+                    co_return ProtocolCompletion { Err(rstd::move(stored).unwrap_err()), remote };
                 }
             }
         }
@@ -655,8 +677,7 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
             if (invalidated.is_err() && client->config.store_failure == StoreFailure::Fail) {
                 message.body.cancel();
                 (void)co_await attempt_control.close();
-                co_return ProtocolCompletion { Err(rstd::move(invalidated).unwrap_err()),
-                                               RemoteOutcome::Confirmed };
+                co_return ProtocolCompletion { Err(rstd::move(invalidated).unwrap_err()), remote };
             }
         }
         if (status == u16(304) && cached.is_some()) {
@@ -684,15 +705,13 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
                 auto updated = co_await (*store)->update(
                     cached->id(), generation, rstd::move(metadata), context.clone());
                 if (updated.is_err() && client->config.store_failure == StoreFailure::Fail)
-                    co_return ProtocolCompletion { Err(rstd::move(updated).unwrap_err()),
-                                                   RemoteOutcome::Confirmed };
+                    co_return ProtocolCompletion { Err(rstd::move(updated).unwrap_err()), remote };
             } else {
                 auto removed = co_await (*store)->invalidate(
                     { key.target.clone(), key.partition.clone(), key.scope.clone() },
                     context.clone());
                 if (removed.is_err() && client->config.store_failure == StoreFailure::Fail)
-                    co_return ProtocolCompletion { Err(rstd::move(removed).unwrap_err()),
-                                                   RemoteOutcome::Confirmed };
+                    co_return ProtocolCompletion { Err(rstd::move(removed).unwrap_err()), remote };
             }
             co_return co_await cached_response(state,
                                                context.clone(),
@@ -705,9 +724,9 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
             if (target.is_err()) {
                 message.body.cancel();
                 (void)co_await attempt_control.close();
-                co_return ProtocolCompletion { Err(Error::Redirect(
-                                                   String::make("invalid redirect target"_str))),
-                                               RemoteOutcome::Confirmed };
+                co_return ProtocolCompletion {
+                    Err(Error::Redirect(String::make("invalid redirect target"_str))), remote
+                };
             }
             if (target->is_some()) {
                 auto& policy = *state->policy.redirect;
@@ -720,7 +739,7 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
                         message.body.cancel();
                         (void)co_await attempt_control.close();
                         co_return ProtocolCompletion { Err(rstd::move(chosen).unwrap_err()),
-                                                       RemoteOutcome::Confirmed };
+                                                       remote };
                     }
                     action = *chosen;
                 }
@@ -741,7 +760,7 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
                         co_return ProtocolCompletion {
                             Err(Error::Redirect(
                                 String::make("redirect refused by policy or limit"_str))),
-                            RemoteOutcome::Confirmed
+                            remote
                         };
                     }
                     bool get =
@@ -752,8 +771,7 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
                     if (! get && ! request.body.replayable()) {
                         message.body.cancel();
                         (void)co_await attempt_control.close();
-                        co_return ProtocolCompletion { Err(Error::ReplayUnavailable()),
-                                                       RemoteOutcome::Confirmed };
+                        co_return ProtocolCompletion { Err(Error::ReplayUnavailable()), remote };
                     }
                     co_await drain_response(rstd::move(message.body),
                                             client->config.drain_limit,
@@ -801,21 +819,19 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
                                          request.parts,
                                          nullptr,
                                          &message.head,
-                                         RemoteOutcome::Confirmed,
+                                         remote,
                                          retries,
                                          status_retries);
             if (decision.is_err()) {
                 message.body.cancel();
                 (void)co_await attempt_control.close();
-                co_return ProtocolCompletion { Err(rstd::move(decision).unwrap_err()),
-                                               RemoteOutcome::Confirmed };
+                co_return ProtocolCompletion { Err(rstd::move(decision).unwrap_err()), remote };
             }
             if (decision->retry) {
                 if (! request.body.replayable()) {
                     message.body.cancel();
                     (void)co_await attempt_control.close();
-                    co_return ProtocolCompletion { Err(Error::ReplayUnavailable()),
-                                                   RemoteOutcome::Confirmed };
+                    co_return ProtocolCompletion { Err(Error::ReplayUnavailable()), remote };
                 }
                 co_await drain_response(rstd::move(message.body),
                                         client->config.drain_limit,
@@ -827,8 +843,7 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
                 ++status_retries;
                 auto wait = co_await context.delay(decision->delay);
                 if (wait.is_err())
-                    co_return ProtocolCompletion { Err(rstd::move(wait).unwrap_err()),
-                                                   RemoteOutcome::Confirmed };
+                    co_return ProtocolCompletion { Err(rstd::move(wait).unwrap_err()), remote };
                 continue;
             }
         }
@@ -853,7 +868,7 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
                         message.body.cancel();
                         (void)co_await attempt_control.close();
                         co_return ProtocolCompletion { Err(rstd::move(writer).unwrap_err()),
-                                                       RemoteOutcome::Confirmed };
+                                                       remote };
                     }
                 } else {
                     auto tap     = Arc<TapState>::make(rstd::move(message.body),
@@ -867,7 +882,7 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
             }
         }
         auto completion = co_await publish_response(
-            state, context.clone(), rstd::move(output), rstd::move(message), false);
+            state, context.clone(), rstd::move(output), rstd::move(message));
         auto report = co_await attempt_control.wait();
         record_attempt(state, request.parts, Some(status), report);
         if (completion.result.is_ok() && report->logical.result.is_err())
@@ -882,7 +897,8 @@ auto valid_policy(const ExecutionPolicy& policy, bool store) -> bool {
            (policy.cache == CacheMode::Disabled || policy.cache == CacheMode::Bypass || store);
 }
 auto ClientConfig::validate() const -> Result<empty> {
-    if (! valid_policy(policy, cache.is_some()) || (cache.is_some() && ! cache->store()) ||
+    if (! valid_policy(policy, cache.is_some()) ||
+        (cache.is_some() && cache->is_Store() && ! cache->as_Store().value.store()) ||
         (cookies.is_some() && ! cookies->jar()) ||
         (routing.route.is_some() && routing.shared_provider.is_some()) ||
         (total_timeout.is_some() && total_timeout->is_zero()))
@@ -895,6 +911,11 @@ auto Client::make(EngineHandle engine, BackendBinding backend, ClientConfig conf
     if (valid.is_err()) return Err(rstd::move(valid).unwrap_err());
     if (! backend.backend())
         return Err(Error::InvalidOptions(String::make("null HTTP backend"_str)));
+    if (config.cache.is_some() && config.cache->is_Backend()) {
+        auto supported = backend.backend()->capabilities().cache.validate(
+            config.policy.cache, ""_str, config.store_failure);
+        if (supported.is_err()) return Err(rstd::move(supported).unwrap_err());
+    }
     auto scope = engine.scope();
     if (scope.is_err()) return Err(rstd::move(scope).unwrap_err());
     auto state =
@@ -931,6 +952,19 @@ auto Client::clone() const -> Client {
 }
 auto Client::policy() const -> ExecutionPolicy {
     return state_->config.policy.clone();
+}
+auto Client::cache_capabilities() const -> CacheCapabilities {
+    if (state_->config.cache.is_none()) return {};
+    if (state_->config.cache->is_Backend()) return capabilities().cache;
+    return { .provider       = CacheProvider::Store,
+             .configured     = true,
+             .default_mode   = true,
+             .revalidate     = true,
+             .only_if_cached = true,
+             .head           = true,
+             .vary           = true,
+             .store_errors   = true,
+             .readiness      = CacheReadiness::Ready };
 }
 auto Client::resources() const -> ResourceContext {
     return state_->scope.resources();
@@ -1016,6 +1050,18 @@ auto Client::execute(ExecutionRequest request, ExecuteOptions options) const
         return Err(Rejected<ExecutionRequest> {
             Error::InvalidOptions(String::make("invalid HTTP policy or routing"_str)),
             rstd::move(request) });
+    if (state_->config.cache.is_some() && state_->config.cache->is_Backend()) {
+        auto cached = cache_capabilities().validate(
+            policy.cache, options.partition.as_str(), state_->config.store_failure);
+        if (cached.is_err())
+            return Err(Rejected<ExecutionRequest> { rstd::move(cached).unwrap_err(),
+                                                    rstd::move(request) });
+        auto supported = capabilities().validate_cache(
+            cache_directive(policy.cache), request.parts, request.body.metadata());
+        if (supported.is_err())
+            return Err(Rejected<ExecutionRequest> { rstd::move(supported).unwrap_err(),
+                                                    rstd::move(request) });
+    }
     auto resolved = resolve_transfer_options(
         options.transfer, options.total_timeout, state_->config.total_timeout);
     if (resolved.is_err())

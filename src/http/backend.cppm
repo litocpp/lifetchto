@@ -38,6 +38,7 @@ class PreparedExchange {
     UploadMetadata            upload_;
     RouteChoice               route_;
     CacheScope                cache_;
+    CacheDirective            cache_directive_;
     Option<ProxyEndpoint>     proxy_;
 #if LITO_FEAT_HTTP2
     Option<lihttpto::h2::Request> http2_;
@@ -48,22 +49,26 @@ public:
                      BackendIdentity           backend,
                      UploadMetadata            upload,
                      RouteChoice               route,
-                     CacheScope                cache)
+                     CacheScope                cache,
+                     CacheDirective            directive = CacheDirective::Disabled)
         : request_(rstd::move(request)),
           backend_(rstd::move(backend)),
           upload_(rstd::move(upload)),
           route_(rstd::move(route)),
-          cache_(rstd::move(cache)) {}
+          cache_(rstd::move(cache)),
+          cache_directive_(directive) {}
     static auto make(lihttpto::PreparedRequest request,
                      BackendIdentity           backend,
                      UploadMetadata            upload,
                      RouteChoice               route,
-                     CacheScope                cache) -> PreparedExchange {
+                     CacheScope                cache,
+                     CacheDirective directive = CacheDirective::Disabled) -> PreparedExchange {
         return PreparedExchange(rstd::move(request),
                                 rstd::move(backend),
                                 rstd::move(upload),
                                 rstd::move(route),
-                                rstd::move(cache));
+                                rstd::move(cache),
+                                directive);
     }
 #if LITO_FEAT_HTTP2
     auto request_for_http2() const { return request_.http2_request(); }
@@ -75,12 +80,17 @@ public:
     auto backend_identity() const -> const BackendIdentity& { return backend_; }
     auto upload() const -> const UploadMetadata& { return upload_; }
     auto target() const -> const RouteChoice& { return route_; }
+    auto cache_directive() const -> CacheDirective { return cache_directive_; }
     auto cache_scope() const -> const CacheScope& { return cache_; }
     auto proxy() const -> const Option<ProxyEndpoint>& { return proxy_; }
     void set_proxy(Option<ProxyEndpoint> proxy) { proxy_ = rstd::move(proxy); }
     auto clone() const -> PreparedExchange {
-        auto copy = PreparedExchange(
-            request_.clone(), backend_.clone(), upload_.clone(), route_.clone(), cache_.clone());
+        auto copy = PreparedExchange(request_.clone(),
+                                     backend_.clone(),
+                                     upload_.clone(),
+                                     route_.clone(),
+                                     cache_.clone(),
+                                     cache_directive_);
         if (proxy_.is_some()) copy.proxy_ = Some(proxy_->clone());
 #if LITO_FEAT_HTTP2
         if (http2_.is_some()) copy.http2_ = Some(http2_->clone());
@@ -100,9 +110,34 @@ struct BackendCapabilities {
     TcpCapabilities tcp;
     bool tls_custom_ca {}, tls_identity {}, tls_verification {}, low_speed {}, connect_timeout {};
     ProxyCapabilities proxy;
-    auto              validate(const lihttpto::RequestParts& parts,
-                               const UploadMetadata&         upload,
-                               const RouteChoice&            route = {}) const -> Result<empty> {
+    CacheCapabilities cache;
+    auto              validate_cache(CacheDirective                directive,
+                                     const lihttpto::RequestParts& parts,
+                                     const UploadMetadata&         upload) const -> Result<empty> {
+        if (directive == CacheDirective::Disabled) return Ok(empty {});
+        auto supported =
+            cache.validate(directive == CacheDirective::Default      ? CacheMode::Default
+                           : directive == CacheDirective::Revalidate ? CacheMode::Revalidate
+                                                                     : CacheMode::OnlyIfCached,
+                           ""_str,
+                           StoreFailure::Bypass);
+        if (supported.is_err()) return supported;
+        if (parts.method.as_ref() == "GET"_str && upload.length == Some(u64()) &&
+            ((! cache.credentials && (parts.headers.contains("authorization"_str) ||
+                                      parts.headers.contains("cookie"_str))) ||
+             (! cache.range && parts.headers.contains("range"_str)) ||
+             (! cache.user_conditions && (parts.headers.contains("if-none-match"_str) ||
+                                          parts.headers.contains("if-modified-since"_str) ||
+                                          parts.headers.contains("if-match"_str) ||
+                                          parts.headers.contains("if-unmodified-since"_str) ||
+                                          parts.headers.contains("if-range"_str)))))
+            return Err(Error::Unsupported(
+                "backend cache does not support identity, range or user conditional requests"_Str));
+        return Ok(empty {});
+    }
+    auto validate(const lihttpto::RequestParts& parts,
+                  const UploadMetadata&         upload,
+                  const RouteChoice&            route = {}) const -> Result<empty> {
         if (parts.url.scheme() == Some("https"_str) && ! https)
             return Err(Error::Unsupported("backend does not support HTTPS"_Str));
         if (upload.length.is_none() && ! unknown_upload_length)
@@ -132,10 +167,12 @@ struct ExchangeBackend {
     template<class Self, class = void>
     struct Api {
         using Trait = ExchangeBackend;
-        auto prepare(lihttpto::RequestParts parts, UploadMetadata upload, RouteChoice route) const
-            -> Result<PreparedExchange> {
+        auto prepare(lihttpto::RequestParts parts,
+                     UploadMetadata         upload,
+                     RouteChoice            route,
+                     CacheDirective         cache) const -> Result<PreparedExchange> {
             return rstd::trait_call<0>(
-                this, rstd::move(parts), rstd::move(upload), rstd::move(route));
+                this, rstd::move(parts), rstd::move(upload), rstd::move(route), cache);
         }
         auto operation(ExchangeInput input) const
             -> rstd::Result<PreparedOperation<ResponseMessage>, Rejected<ExchangeInput>> {
@@ -183,8 +220,10 @@ public:
     static auto make(ResourceContext resources, TransportOptions options = {})
         -> Result<NativeBackend>;
     auto clone() const -> NativeBackend;
-    auto prepare(lihttpto::RequestParts parts, UploadMetadata upload, RouteChoice route = {}) const
-        -> Result<PreparedExchange>;
+    auto prepare(lihttpto::RequestParts parts,
+                 UploadMetadata         upload,
+                 RouteChoice            route = {},
+                 CacheDirective cache = CacheDirective::Disabled) const -> Result<PreparedExchange>;
     auto operation(ExchangeInput input) const
         -> rstd::Result<PreparedOperation<ResponseMessage>, Rejected<ExchangeInput>>;
     auto backend() const -> Arc<rstd::dyn<ExchangeBackend>>;
@@ -202,8 +241,10 @@ struct Impl<lifetchto::http::ExchangeBackend, lifetchto::http::NativeBackend>
     : ImplBase<lifetchto::http::NativeBackend> {
     auto prepare(lihttpto::RequestParts          parts,
                  lifetchto::http::UploadMetadata upload,
-                 lifetchto::http::RouteChoice    route) const {
-        return this->self().prepare(rstd::move(parts), rstd::move(upload), rstd::move(route));
+                 lifetchto::http::RouteChoice    route,
+                 lifetchto::http::CacheDirective cache) const {
+        return this->self().prepare(
+            rstd::move(parts), rstd::move(upload), rstd::move(route), cache);
     }
     auto operation(lifetchto::http::ExchangeInput input) const {
         return this->self().operation(rstd::move(input));

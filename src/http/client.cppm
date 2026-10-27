@@ -5,19 +5,6 @@ export import :upgrade;
 using namespace rstd::prelude;
 export namespace lifetchto::http
 {
-enum class CacheMode
-{
-    Disabled,
-    Default,
-    Revalidate,
-    Bypass,
-    OnlyIfCached
-};
-enum class StoreFailure
-{
-    Bypass,
-    Fail
-};
 enum class RedirectAction
 {
     Follow,
@@ -139,6 +126,9 @@ struct AttemptReport {
 struct ExecutionFacts {
     Option<lihttpto::RequestParts> request;
     bool                           from_cache {};
+    CacheObservation               cache { CacheOrigin::Unknown,
+                                           NetworkAccess::Unknown,
+                                           CacheValidation::Unknown };
     bool                           history_truncated {};
     usize                          redirects {}, attempts {};
     Vec<AttemptReport>             history;
@@ -148,6 +138,7 @@ struct ExecutionFacts {
         ExecutionFacts copy;
         copy.request = request.is_some() ? Some(request->clone()) : None<lihttpto::RequestParts>();
         copy.from_cache        = from_cache;
+        copy.cache             = cache;
         copy.history_truncated = history_truncated;
         copy.redirects         = redirects;
         copy.attempts          = attempts;
@@ -208,7 +199,7 @@ struct ExecuteOptions {
 };
 struct ClientConfig {
     ExecutionPolicy       policy;
-    Option<StoreBinding>  cache;
+    Option<CacheBinding>  cache;
     StoreFailure          store_failure { StoreFailure::Bypass };
     Option<Duration>      total_timeout { Some(Duration::from_secs(u64(30))) };
     usize                 drain_limit { 65536 };
@@ -218,7 +209,7 @@ struct ClientConfig {
     auto                  validate() const -> Result<empty>;
     auto                  clone() const -> ClientConfig {
         return { policy.clone(),
-                 cache.is_some() ? Some(cache->clone()) : None<StoreBinding>(),
+                 cache.is_some() ? Some(cache->clone()) : None<CacheBinding>(),
                  store_failure,
                  total_timeout,
                  drain_limit,
@@ -243,6 +234,7 @@ public:
     auto clone() const -> Client;
     auto policy() const -> ExecutionPolicy;
     auto capabilities() const -> BackendCapabilities;
+    auto cache_capabilities() const -> CacheCapabilities;
     auto resources() const -> ResourceContext;
     auto prepare_connection(DuplexRequest, DuplexOptions = {}) const
         -> rstd::Result<ConnectionPlan, Rejected<DuplexRequest>>;

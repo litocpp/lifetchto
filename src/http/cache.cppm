@@ -164,6 +164,14 @@ public:
     }
     auto clone() const -> StoreBinding { return is_Owned() ? Owned(store()) : Shared(store()); }
 };
+class CacheBinding {
+    RSTD_ENUM(CacheBinding, (Store, (StoreBinding value;)), (Backend))
+public:
+    auto clone() const -> CacheBinding {
+        return is_Store() ? Store(as_Store().value.clone()) : Backend();
+    }
+};
+
 struct MemoryCacheOptions {
     usize max_entries { 16 };
     usize max_bytes { 16 * 1024 * 1024 };
