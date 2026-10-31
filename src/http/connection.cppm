@@ -165,6 +165,65 @@ auto connect_deadline(const TransportOptions& options, const BodyState& body) ->
     if (body.deadline.is_some() && *body.deadline < result) result = *body.deadline;
     return result;
 }
+auto close_dial(Arc<rstd::dyn<TcpDial>> dial, Arc<NativeState> client, Arc<BodyState> body)
+    -> coro<empty> {
+    auto result = co_await dial->close();
+    if (result.is_err()) {
+        {
+            auto f = client->fields.lock().unwrap();
+            if (f->close_error.is_none()) f->close_error = Some(result.unwrap_err().clone());
+        }
+        auto f = body->fields.lock().unwrap();
+        if (f->cleanup_error.is_none()) f->cleanup_error = Some(rstd::move(result).unwrap_err());
+    }
+    co_return empty {};
+}
+auto connect_tcp(rstd::net::SocketAddr                address,
+                 Option<Arc<rstd::dyn<TcpConnector>>> connector,
+                 Arc<NativeState>                     client,
+                 Arc<BodyState>                       body,
+                 Instant deadline) -> coro<Result<rstd::net::TcpStream>> {
+    if (connector.is_some()) {
+        auto prepared = (*connector)->prepare(address);
+        if (prepared.is_err()) co_return Err(rstd::move(prepared).unwrap_err());
+        auto dial      = rstd::move(prepared).unwrap();
+        auto finish    = Some(dial->finish().into_future());
+        auto connected = co_await rstd::async::select(
+            rstd::future::by_ref(*finish), connect_stop(body.clone(), deadline).into_future());
+        finish = None();
+        if (connected.is_right()) {
+            co_await close_dial(dial.clone(), client.clone(), body.clone());
+            co_return Err(rstd::move(connected).unwrap_right());
+        }
+        auto result = rstd::move(connected).unwrap_left();
+        if (result.is_err()) {
+            co_await close_dial(dial.clone(), client.clone(), body.clone());
+            co_return Err(rstd::move(result).unwrap_err());
+        }
+        auto stream = dial->into_stream();
+        if (stream.is_err()) co_await close_dial(dial.clone(), client.clone(), body.clone());
+        co_return rstd::move(stream);
+    }
+    auto prepared = rstd::net::TcpStream::prepare_connect(address);
+    if (prepared.is_err()) co_return Err(Error::Connect(prepared.unwrap_err()));
+    auto connecting = rstd::move(prepared).unwrap();
+    auto finish     = Some(connecting.finish().into_future());
+    auto connected  = co_await rstd::async::select(
+        rstd::future::by_ref(*finish), connect_stop(body.clone(), deadline).into_future());
+    finish = None();
+    if (connected.is_right()) {
+        (void)co_await rstd::move(connecting).close();
+        co_return Err(rstd::move(connected).unwrap_right());
+    }
+    auto result = rstd::move(connected).unwrap_left();
+    if (result.is_err()) {
+        (void)co_await rstd::move(connecting).close();
+        co_return Err(Error::Connect(result.unwrap_err()));
+    }
+    auto stream = rstd::move(connecting).into_stream();
+    if (stream.is_err()) co_return Err(Error::Connect(stream.unwrap_err()));
+    co_return Ok(rstd::move(stream).unwrap());
+}
 auto connect_to(Arc<NativeState>     client,
                 Arc<Slot>            slot,
                 const lihttpto::Url& url,
@@ -229,6 +288,8 @@ auto connect_to(Arc<NativeState>     client,
         addresses = rstd::move(result).unwrap();
     }
     if (addresses.is_empty() || addresses.len() > usize(64)) co_return Err(Error::Capacity());
+    Option<Arc<rstd::dyn<TcpConnector>>> connector;
+    if (slot->route.is_some()) connector = (*slot->route)->connector().clone();
     Option<Error> last;
     for (auto address : addresses) {
         {
@@ -236,27 +297,14 @@ auto connect_to(Arc<NativeState>     client,
             if (f->canceled) co_return Err(Error::Canceled());
         }
         if (Instant::now() >= deadline) co_return Err(Error::Timeout());
-        auto prepared = rstd::net::TcpStream::prepare_connect(address);
-        if (prepared.is_err()) {
-            last = Some(Error::Connect(prepared.unwrap_err()));
-            continue;
-        }
-        auto connecting = rstd::move(prepared).unwrap();
-        auto finish     = Some(connecting.finish().into_future());
-        auto connected  = co_await rstd::async::select(
-            rstd::future::by_ref(*finish), connect_stop(body.clone(), deadline).into_future());
-        if (connected.is_right()) {
-            finish = None();
-            (void)co_await rstd::move(connecting).close();
-            co_return Err(rstd::move(connected).unwrap_right());
-        }
-        auto result = rstd::move(connected).unwrap_left();
+        auto result = co_await connect_tcp(
+            address, connector.clone(), client.clone(), body.clone(), deadline);
         if (result.is_err()) {
-            last = Some(Error::Connect(result.unwrap_err()));
-            (void)co_await rstd::move(connecting).close();
+            last = Some(rstd::move(result).unwrap_err());
+            if (last->is_Canceled() || last->is_Timeout()) co_return Err(last.take().unwrap());
             continue;
         }
-        connection.tcp  = Some(rstd::move(connecting).into_stream().unwrap());
+        connection.tcp  = Some(rstd::move(result).unwrap());
         auto configured = connection.tcp->set_nodelay(client->options.tcp.nodelay.unwrap_or(true));
         if (configured.is_ok() && client->options.tcp.keepalive.is_some())
             configured = connection.tcp->set_keepalive(*client->options.tcp.keepalive);

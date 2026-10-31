@@ -4,6 +4,7 @@
 #include <dirent.h>
 #endif
 #include "support.hpp"
+#include "tcp_connector.hpp"
 using namespace rstd::prelude;
 using namespace rstd::literals;
 using namespace lifetchto;
@@ -101,6 +102,46 @@ TEST(H2Peer, StreamingUploadTrailersAndDynamicHeaders) {
         auto body     = response.take_body().unwrap();
         EXPECT_EQ((co_await body.bytes(usize(1024 * 1024))).unwrap().len(), usize(512 * 1024));
         EXPECT_TRUE((co_await client.close()).is_ok());
+        co_return empty {};
+    };
+    runtime.block_on(task());
+}
+TEST(H2Peer, TcpConnectorPreservesTlsAlpnAndRoutePoolIdentity) {
+    if (! ::getenv("LIFETCHTO_H2_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto task    = [&]() -> coro<empty> {
+        auto stats     = test_connector::Stats::make(test_connector::Counts {});
+        auto physical  = rstd::net::SocketAddr::ipv4_loopback(h2_port());
+        auto url       = lihttpto::Url::parse_http(h2_url("/ok"_str).as_str()).unwrap();
+        auto connector = Arc<rstd::dyn<http::TcpConnector>>::make(
+            test_connector::Connector { physical, stats.clone() });
+        auto make_route = [&] {
+            Vec<rstd::net::SocketAddr> addresses;
+            addresses.push(rstd::net::SocketAddr::ipv4_loopback(u16(1)));
+            return Arc<Route>::make(
+                Route::tcp(url, rstd::move(addresses), u64(), Some(connector.clone())).unwrap());
+        };
+        auto first  = make_route();
+        auto second = make_route();
+        auto client = TestClient::make(runtime.handle(), h2_options(VersionPolicy::Http2)).unwrap();
+        Option<String> identity;
+        for (usize index; index < usize(3); ++index) {
+            auto response =
+                (co_await h2_get(client, index < usize(2) ? first : second, "/ok"_str)).unwrap();
+            EXPECT_EQ(response.head().version->major(), u8(2));
+            auto actual = *response.head().headers.get_unique_text("x-connection"_str).unwrap();
+            if (index == usize())
+                identity = Some(String::make(actual));
+            else if (index == usize(1))
+                EXPECT_EQ(actual, identity->as_str());
+            else
+                EXPECT_NE(actual, identity->as_str());
+            EXPECT_EQ((co_await h2_text(response)).unwrap().as_str(), "hello"_str);
+        }
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_EQ(stats->lock().unwrap()->prepared, usize(2));
+        EXPECT_EQ(stats->lock().unwrap()->taken, usize(2));
+        EXPECT_EQ(stats->lock().unwrap()->closes, usize());
         co_return empty {};
     };
     runtime.block_on(task());
