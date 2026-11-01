@@ -623,6 +623,58 @@ TEST(HttpCache, PublicStoreCachesAndPartitionsAndAbortsTruncatedBodies) {
     };
     runtime.block_on(run());
 }
+TEST(HttpCache, NonStorableReplacementInvalidatesPreviouslyFreshEntry) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        auto engine = lf::Engine::make(runtime.handle()).unwrap();
+        auto script = Script::make(Scenario {});
+        {
+            auto  f = script->lock().unwrap();
+            Reply initial;
+            initial.headers.add("Cache-Control"_str, "max-age=600"_str).unwrap();
+            initial.headers.add("ETag"_str, "\"initial\""_str).unwrap();
+            initial.data = Bytes::copy_from_slice("initial"_str.as_bytes());
+            f->replies.push(rstd::move(initial));
+            for (int i = 0; i < 2; ++i) {
+                Reply replacement;
+                replacement.headers.add("Cache-Control"_str, "no-store"_str).unwrap();
+                replacement.data = Bytes::copy_from_slice("replacement"_str.as_bytes());
+                f->replies.push(rstd::move(replacement));
+            }
+        }
+        auto            cache = h::MemoryCache::make(engine.resources()).unwrap();
+        h::ClientConfig config;
+        config.policy.cache = h::CacheMode::Default;
+        config.cache        = Some(h::CacheBinding::Store(h::StoreBinding::Shared(cache.store())));
+        auto client =
+            h::Client::make(engine.handle(), binding(script.clone()), rstd::move(config)).unwrap();
+        for (int i = 0; i < 4; ++i) {
+            auto input = request();
+            if (i == 2) input.parts.headers.add("Cache-Control"_str, "no-cache"_str).unwrap();
+            h::ExecutionObserver observer;
+            h::ExecuteOptions    options;
+            options.report = Some(observer.clone());
+            auto transfer  = client.execute(rstd::move(input), rstd::move(options)).unwrap();
+            auto body      = co_await finish(transfer);
+            EXPECT_TRUE(body.is_ok());
+            if (body.is_ok())
+                EXPECT_EQ(body->as_slice(), (i < 2 ? "initial"_str : "replacement"_str).as_bytes());
+            EXPECT_EQ((co_await observer.wait()).unwrap().facts.from_cache, i == 1);
+        }
+        {
+            auto f = script->lock().unwrap();
+            EXPECT_EQ(f->seen.len(), usize(3));
+            if (f->seen.len() == usize(3)) {
+                EXPECT_TRUE(f->seen[usize(1)].parts.headers.contains("if-none-match"_str));
+                EXPECT_FALSE(f->seen[usize(2)].parts.headers.contains("if-none-match"_str));
+            }
+        }
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
 namespace
 {
 struct ContextDriver {

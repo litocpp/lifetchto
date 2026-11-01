@@ -854,12 +854,24 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
                 continue;
             }
         }
-        if (eligible && have_generation && store.is_some() && status == u16(200) &&
-            ! message.head.headers.contains("set-cookie"_str)) {
+        if (eligible && have_generation && store.is_some() && status == u16(200)) {
             auto policy = lihttpto::CachePolicy::make(message.head.headers, requested, cache_now());
-            if (policy.fields.reusable &&
-                (policy.lifetime() > i64() || policy.fields.etag.is_some() ||
-                 policy.fields.last_modified.is_some())) {
+            bool reusable = policy.fields.reusable &&
+                            ! message.head.headers.contains("set-cookie"_str) &&
+                            (policy.lifetime() > i64() || policy.fields.etag.is_some() ||
+                             policy.fields.last_modified.is_some());
+            if (! reusable && cached.is_some()) {
+                auto invalidated = co_await (*store)->invalidate(
+                    { key.target.clone(), key.partition.clone(), key.scope.clone() },
+                    context.clone());
+                if (invalidated.is_err() && client->config.store_failure == StoreFailure::Fail) {
+                    message.body.cancel();
+                    (void)co_await attempt_control.close();
+                    co_return ProtocolCompletion { Err(rstd::move(invalidated).unwrap_err()),
+                                                   remote };
+                }
+            }
+            if (reusable) {
                 auto variant = variant_key(policy.fields, request.parts.headers);
                 auto writer  = co_await (*store)->begin_write({ key.clone(),
                                                                 generation,
