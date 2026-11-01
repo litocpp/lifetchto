@@ -11,9 +11,11 @@ auto observe(Arc<ExecutionObserverState> state) -> coro<Result<ExecutionReport>>
         if (f->control.is_none()) co_return Err(Error::Closed());
         control = Some(f->control->clone());
     }
-    auto report = co_await control->wait();
-    auto f      = state->fields.lock().unwrap();
-    co_return Ok(ExecutionReport { f->facts.clone(), rstd::move(report) });
+    auto report         = co_await control->wait();
+    auto f              = state->fields.lock().unwrap();
+    auto facts          = f->facts.clone();
+    facts.body_progress = f->body_progress.snapshot();
+    co_return Ok(ExecutionReport { rstd::move(facts), rstd::move(report) });
 }
 auto ExecutionObserver::wait() const -> coro<Result<ExecutionReport>> {
     return observe(state_.clone());
@@ -602,7 +604,12 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
         if (opened.is_err())
             co_return ProtocolCompletion { Err(rstd::move(opened).unwrap_err()),
                                            RemoteOutcome::NotDispatched };
-        auto operation = backend->operation({ prepared.clone(), rstd::move(opened).unwrap() });
+        auto traffic = [&] {
+            auto f = state->report->fields.lock().unwrap();
+            return f->body_progress.clone();
+        }();
+        auto operation = backend->operation(
+            { prepared.clone(), rstd::move(opened).unwrap(), Some(rstd::move(traffic)) });
         if (operation.is_err()) {
             auto rejected = rstd::move(operation).unwrap_err();
             rejected.input.body.cancel();

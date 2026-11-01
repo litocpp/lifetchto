@@ -106,6 +106,89 @@ TEST(H2Peer, StreamingUploadTrailersAndDynamicHeaders) {
     };
     runtime.block_on(task());
 }
+TEST(H2Peer, BodyTrafficKeepsMultiplexedPayloadsSeparateAndSurvivesReset) {
+    if (! ::getenv("LIFETCHTO_H2_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        auto engine    = Engine::make(runtime.handle()).unwrap();
+        auto transport = h2_options(VersionPolicy::Http2);
+        auto native =
+            http::NativeBackend::make(engine.resources(),
+                                      rstd::move(static_cast<http::TransportOptions&>(transport)))
+                .unwrap();
+        http::ClientConfig config;
+        config.routing.route = Some(h2_route());
+        auto client          = http::Client::make(engine.handle(),
+                                                  http::BackendBinding::Owned(native.backend()),
+                                                  rstd::move(config))
+                                   .unwrap();
+        Vec<Transfer<http::ResponseMessage>> transfers;
+        Vec<http::ExecutionObserver>         observers;
+        auto payloads = array<ref<str>, 3> { "abc"_str, "12345"_str, "xy"_str };
+        for (auto payload : payloads) {
+            http::ExecutionObserver observer;
+            http::ExecuteOptions    options;
+            options.report = Some(observer.clone());
+            http::ExecutionRequest request {
+                { lihttpto::Url::parse_http(h2_url("/echo"_str).as_str()).unwrap(),
+                  lihttpto::Method::parse("POST"_str).unwrap(),
+                  {} },
+                http::UploadPlan::bytes(Bytes::copy_from_slice(payload.as_bytes()))
+            };
+            transfers.push(client.execute(rstd::move(request), rstd::move(options)).unwrap());
+            observers.push(rstd::move(observer));
+        }
+        Option<String> connection;
+        for (usize i; i < transfers.len(); ++i) {
+            auto response = (co_await transfers[i].output()).unwrap();
+            EXPECT_EQ(response.head.version->major(), u8(2));
+            auto identity = *response.head.headers.get_unique_text("x-connection"_str).unwrap();
+            if (connection.is_none()) connection = Some(String::make(identity));
+            EXPECT_EQ(connection->as_str(), identity);
+            usize count;
+            for (;;) {
+                auto bytes = (co_await response.body.next()).unwrap();
+                if (bytes.is_none()) break;
+                count += bytes->len();
+            }
+            auto report = (co_await observers[i].wait()).unwrap();
+            EXPECT_TRUE(report.transfer->logical.result.is_ok());
+            EXPECT_EQ(count, payloads[i].len());
+            EXPECT_EQ(report.facts.body_progress.body_sent_bytes,
+                      Some(u64(payloads[i].len().to_primitive())));
+            EXPECT_EQ(report.facts.body_progress.body_received_bytes,
+                      Some(u64(payloads[i].len().to_primitive())));
+        }
+        for (auto path : array<ref<str>, 2> { "/truncated"_str, "/reset"_str }) {
+            http::ExecutionObserver observer;
+            http::ExecuteOptions    options;
+            options.report = Some(observer.clone());
+            http::ExecutionRequest request {
+                { lihttpto::Url::parse_http(h2_url(path).as_str()).unwrap(),
+                  lihttpto::Method::parse("POST"_str).unwrap(),
+                  {} },
+                http::UploadPlan::bytes(Bytes::copy_from_slice("abc"_bytes))
+            };
+            auto transfer = client.execute(rstd::move(request), rstd::move(options)).unwrap();
+            auto response = co_await transfer.output();
+            if (response.is_ok()) {
+                for (;;) {
+                    auto next = co_await response->body.next();
+                    if (next.is_err() || next->is_none()) break;
+                }
+            }
+            auto report = (co_await observer.wait()).unwrap();
+            EXPECT_TRUE(report.transfer->logical.result.is_err());
+            EXPECT_EQ(report.facts.body_progress.body_sent_bytes, Some(u64(3)));
+            EXPECT_EQ(report.facts.body_progress.body_received_bytes,
+                      Some(path == "/truncated"_str ? u64(3) : u64()));
+        }
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
 TEST(H2Peer, TcpConnectorPreservesTlsAlpnAndRoutePoolIdentity) {
     if (! ::getenv("LIFETCHTO_H2_PORT")) GTEST_SKIP();
     auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();

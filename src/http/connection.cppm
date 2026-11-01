@@ -59,6 +59,34 @@ struct Connection {
 #endif
         return io_result(tcp->send_all(rstd::move(bytes)));
     }
+    auto send_some(Bytes bytes) -> coro<Result<usize>> {
+#if LITO_FEAT_TLS
+        if (tls.is_some()) return tls_result(tls->send(rstd::move(bytes)));
+#endif
+#if RSTD_OS_UNIX
+        if (unix.is_some()) return io_result(unix->send(rstd::move(bytes)));
+#endif
+        return io_result(tcp->send(rstd::move(bytes)));
+    }
+    auto send_body(Bytes bytes, Arc<BodyState> body, usize payload_offset, usize payload_length)
+        -> coro<Result<usize>> {
+        auto length = bytes.len();
+        if (payload_offset > length || payload_length > length - payload_offset)
+            co_return Err(Error::Contract("invalid HTTP payload span"_Str));
+        usize completed;
+        while (! bytes.is_empty()) {
+            auto result = co_await send_some(bytes.clone());
+            if (result.is_err()) co_return Err(rstd::move(result).unwrap_err());
+            if (*result == usize() || *result > bytes.len())
+                co_return Err(Error::Contract("invalid HTTP write completion"_Str));
+            auto begin = rstd::cmp::max(completed, payload_offset);
+            auto end   = rstd::cmp::min(completed + *result, payload_offset + payload_length);
+            if (end > begin) body->sent_body(end - begin);
+            completed += *result;
+            bytes.advance(*result);
+        }
+        co_return Ok(length);
+    }
     auto close(ConnectionClose behavior = ConnectionClose::Protocol) -> coro<Result<empty>> {
 #if LITO_FEAT_TLS
         if (tls.is_some())

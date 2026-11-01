@@ -23,13 +23,23 @@ struct BodyState {
     rstd::sync::Mutex<BodyFields>    fields { BodyFields {} };
     Event                            changed;
     Option<Instant>                  deadline;
+    Option<BodyTrafficObserver>      body_progress;
     rstd::sync::Mutex<Option<Event>> connection_changed { None<Event>() };
     void                             notify() const {
         changed.notify();
         auto event = connection_changed.lock().unwrap();
         if (event->is_some()) (*event)->notify();
     }
-    explicit BodyState(Option<Instant> deadline): deadline(deadline) {}
+    explicit BodyState(Option<Instant> deadline, Option<BodyTrafficObserver> traffic = {})
+        : deadline(deadline), body_progress(rstd::move(traffic)) {
+        if (body_progress.is_some()) body_progress->initialize();
+    }
+    void sent_body(usize count) const {
+        if (body_progress.is_some()) body_progress->sent(count);
+    }
+    void received_body(usize count) const {
+        if (body_progress.is_some()) body_progress->received(count);
+    }
     void fail(Error e) {
         bool changed = false;
         {

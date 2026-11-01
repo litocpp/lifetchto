@@ -4,6 +4,7 @@ export module lifetchto.http:backend;
 export import :request;
 export import :response;
 export import :duplex;
+export import :traffic;
 using namespace rstd::prelude;
 using namespace rstd::literals;
 export namespace lifetchto::http
@@ -99,8 +100,9 @@ public:
     }
 };
 struct ExchangeInput {
-    PreparedExchange prepared;
-    UploadBody       body;
+    PreparedExchange            prepared;
+    UploadBody                  body;
+    Option<BodyTrafficObserver> body_progress;
 };
 struct BackendCapabilities {
     bool            http1 {}, http2 {}, https {}, unix_socket {}, explicit_routes {};

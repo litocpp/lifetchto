@@ -134,6 +134,7 @@ struct ExecutionFacts {
     Vec<AttemptReport>             history;
     Instant                        started { Instant::now() };
     Option<Instant>                head_received;
+    BodyTraffic                    body_progress;
     auto                           clone() const -> ExecutionFacts {
         ExecutionFacts copy;
         copy.request = request.is_some() ? Some(request->clone()) : None<lihttpto::RequestParts>();
@@ -144,6 +145,7 @@ struct ExecutionFacts {
         copy.attempts          = attempts;
         copy.started           = started;
         copy.head_received     = head_received;
+        copy.body_progress     = body_progress;
         for (const auto& item : history) copy.history.push(item.clone());
         return copy;
     }
@@ -155,6 +157,7 @@ struct ExecutionReport {
 struct ExecutionObserverFields {
     ExecutionFacts          facts;
     Option<TransferControl> control;
+    BodyTrafficObserver     body_progress;
 };
 struct ExecutionObserverState {
     rstd::sync::Mutex<ExecutionObserverFields> fields { ExecutionObserverFields {} };
@@ -170,8 +173,10 @@ public:
         return value;
     }
     auto snapshot() const -> ExecutionFacts {
-        auto f = state_->fields.lock().unwrap();
-        return f->facts.clone();
+        auto f               = state_->fields.lock().unwrap();
+        auto result          = f->facts.clone();
+        result.body_progress = f->body_progress.snapshot();
+        return result;
     }
     auto wait() const -> coro<Result<ExecutionReport>>;
 

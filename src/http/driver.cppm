@@ -59,12 +59,17 @@ auto upload(Connection& connection, Work& work, const TransportOptions& options)
             auto f            = work.body->fields.lock().unwrap();
             f->accepted_bytes = count;
         }
-        auto encoded = work.encoder.encode(lihttpto::BodyFrame::Data(rstd::move(bytes)));
+        auto encoded = work.encoder.encode_piece(lihttpto::BodyFrame::Data(rstd::move(bytes)));
         if (encoded.is_err())
             co_return Err(protocol_error(String::make("request body length mismatch"_str),
                                          None<lihttpto::DecodeError>()));
-        auto sent = co_await guarded(
-            work.body.clone(), connection.send(rstd::move(encoded).unwrap()), true);
+        auto piece = rstd::move(encoded).unwrap();
+        auto sent  = co_await guarded(work.body.clone(),
+                                      connection.send_body(rstd::move(piece.bytes),
+                                                           work.body.clone(),
+                                                           piece.payload_offset,
+                                                           piece.payload_length),
+                                      true);
         if (sent.is_err()) co_return Err(rstd::move(sent).unwrap_err());
     }
     auto trailers = work.request.body().take_trailers();
@@ -209,6 +214,7 @@ auto read_response(Connection&                                      connection,
                         auto queued = f->queue->try_send(rstd::move(chunk));
                         if (queued.is_err()) co_return Err(rstd::move(queued).unwrap_err());
                     }
+                    work.body->received_body(progress->data.len());
                     work.body->notify();
                 }
                 bytes.advance(progress->consumed);

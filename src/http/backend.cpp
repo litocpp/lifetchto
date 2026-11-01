@@ -63,9 +63,11 @@ auto join_slot(Arc<Slot> slot) -> coro<Result<empty>>;
 struct AttemptData {
     Arc<NativeState>      native;
     Option<ExchangeInput> input;
-    Arc<BodyState>        body { Arc<BodyState>::make(None<Instant>()) };
+    Arc<BodyState>        body;
     AttemptData(Arc<NativeState> native, ExchangeInput input)
-        : native(rstd::move(native)), input(Some(rstd::move(input))) {}
+        : native(rstd::move(native)),
+          input(Some(rstd::move(input))),
+          body(Arc<BodyState>::make(None<Instant>(), this->input->body_progress.take())) {}
 };
 struct NativeSlotTask {
     rstd::sync::Weak<NativeState> state;

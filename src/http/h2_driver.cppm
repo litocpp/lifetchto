@@ -85,8 +85,10 @@ struct H2Wake {
     }
 };
 struct H2WriteItem {
-    Bytes bytes;
-    u64   serial;
+    Bytes                  bytes;
+    u64                    serial;
+    Option<Arc<BodyState>> body;
+    usize                  payload_offset {}, payload_length {};
 };
 void h2_stop(H2Stream& stream) {
     if (stream.stopped) return;
@@ -158,9 +160,17 @@ auto h2_driver(Arc<NativeState> client, Arc<Slot> slot, Connection connection, W
         auto output = session.take_output();
         for (auto& item : output) {
             ++io.scheduled;
+            Option<Arc<BodyState>> body;
             if (item.stream != u32())
-                if (auto* s = find(item.stream)) s->last_serial = io.scheduled;
-            outgoing.push({ rstd::move(item.bytes), io.scheduled });
+                if (auto* s = find(item.stream)) {
+                    s->last_serial = io.scheduled;
+                    if (item.payload_length != usize()) body = Some(s->work.body.clone());
+                }
+            outgoing.push({ rstd::move(item.bytes),
+                            io.scheduled,
+                            rstd::move(body),
+                            item.payload_offset,
+                            item.payload_length });
         }
     };
     for (;;) {
@@ -254,8 +264,10 @@ auto h2_driver(Arc<NativeState> client, Arc<Slot> slot, Connection connection, W
                         session.reset(stream);
                         h2_stop(*s);
                         s->local_done = s->remote_done = true;
-                    } else
+                    } else {
                         s->buffered += length;
+                        s->work.body->received_body(length);
+                    }
                     s->work.body->notify();
                     break;
                 }
@@ -477,7 +489,13 @@ auto h2_driver(Arc<NativeState> client, Arc<Slot> slot, Connection connection, W
             if (io.write.is_none() && ! outgoing.is_empty()) {
                 auto item         = outgoing.remove(usize());
                 io.writing_serial = item.serial;
-                io.write          = Some(connection.send(rstd::move(item.bytes)).into_future());
+                io.write =
+                    Some((item.body.is_some() ? connection.send_body(rstd::move(item.bytes),
+                                                                     item.body.take().unwrap(),
+                                                                     item.payload_offset,
+                                                                     item.payload_length)
+                                              : connection.send(rstd::move(item.bytes)))
+                             .into_future());
             }
             if (io.read.is_none() && ! closing)
                 io.read = Some(connection.recv(usize(16384)).into_future());

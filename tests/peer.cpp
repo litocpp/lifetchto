@@ -13,6 +13,30 @@ using rstd::time::Duration;
 using rstd::time::Instant;
 namespace
 {
+auto traffic_request(ref<str> target, ref<str> method = "POST"_str) -> http::ExecutionRequest {
+    return { { lihttpto::Url::parse_http(target).unwrap(),
+               lihttpto::Method::parse(method).unwrap(),
+               {} },
+             http::UploadPlan::bytes(Bytes::copy_from_slice("abc"_bytes)) };
+}
+auto traffic_read(http::ResponseBody& body) -> coro<lifetchto::Result<usize>> {
+    usize count;
+    for (;;) {
+        auto next = co_await body.next();
+        if (next.is_err()) co_return Err(rstd::move(next).unwrap_err());
+        if (next->is_none()) co_return Ok(count);
+        count += (**next).len();
+    }
+}
+struct TrafficSourceFailure {
+    using Error = lifetchto::Error;
+    bool sent {};
+    auto next() -> coro<lifetchto::Result<Option<Bytes>>> {
+        if (sent) co_return Err(Error::BodySource("upload stopped"_Str));
+        sent = true;
+        co_return Ok(Some(Bytes::copy_from_slice("abc"_bytes)));
+    }
+};
 auto env_text(const char* name) -> ref<str> {
     return rstd::ffi::CStr::from_ptr(::getenv(name)).to_str().unwrap();
 }
@@ -67,6 +91,146 @@ struct Source {
     }
 };
 } // namespace
+TEST(Peer, BodyTrafficCountsFixedChunkedAndRedirectBodiesWithoutFraming) {
+    if (! ::getenv("LIFETCHTO_PEER_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        auto               engine = Engine::make(runtime.handle()).unwrap();
+        auto               native = http::NativeBackend::make(engine.resources()).unwrap();
+        http::ClientConfig config;
+        config.policy.redirect = Some(http::RedirectPolicy {});
+        auto client            = http::Client::make(engine.handle(),
+                                                    http::BackendBinding::Owned(native.backend()),
+                                                    rstd::move(config))
+                                     .unwrap();
+        for (auto path : array<ref<str>, 3> { "/echo"_str, "/chunked"_str, "/adapter-307"_str }) {
+            http::ExecutionObserver observer;
+            http::ExecuteOptions    options;
+            options.report = Some(observer.clone());
+            auto request   = traffic_request(url(path).as_str());
+            if (path == "/chunked"_str) {
+                lihttpto::Headers trailers;
+                trailers.add("X-End"_str, "abc"_str).unwrap();
+                request.body = http::UploadPlan::bytes(Bytes::copy_from_slice("abc"_bytes),
+                                                       Some(rstd::move(trailers)));
+            }
+            auto transfer = client.execute(rstd::move(request), rstd::move(options)).unwrap();
+            auto response = (co_await transfer.output()).unwrap();
+            EXPECT_EQ((co_await traffic_read(response.body)).unwrap(),
+                      path == "/chunked"_str ? usize(5) : usize(3));
+            auto report = (co_await observer.wait()).unwrap();
+            EXPECT_TRUE(report.transfer->logical.result.is_ok());
+            auto progress = observer.snapshot().body_progress;
+            EXPECT_EQ(progress.body_sent_bytes, Some(path == "/adapter-307"_str ? u64(6) : u64(3)));
+            EXPECT_EQ(progress.body_received_bytes,
+                      Some(path == "/adapter-307"_str ? u64(8)
+                           : path == "/chunked"_str   ? u64(5)
+                                                      : u64(3)));
+            EXPECT_EQ(report.facts.body_progress.body_sent_bytes, progress.body_sent_bytes);
+            EXPECT_EQ(report.facts.body_progress.body_received_bytes, progress.body_received_bytes);
+        }
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
+TEST(Peer, BodyTrafficRetainsReceivedBytesAfterErrorAndUnreadCancellation) {
+    if (! ::getenv("LIFETCHTO_PEER_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        auto                   engine = Engine::make(runtime.handle()).unwrap();
+        http::TransportOptions transport;
+        transport.receive_window = usize(8);
+        auto native = http::NativeBackend::make(engine.resources(), rstd::move(transport)).unwrap();
+        auto client =
+            http::Client::make(engine.handle(), http::BackendBinding::Owned(native.backend()))
+                .unwrap();
+        for (auto path : array<ref<str>, 2> { "/truncated"_str, "/large"_str }) {
+            http::ExecutionObserver observer;
+            http::ExecuteOptions    options;
+            options.report = Some(observer.clone());
+            auto transfer =
+                client.execute(traffic_request(url(path).as_str()), rstd::move(options)).unwrap();
+            auto response = (co_await transfer.output()).unwrap();
+            if (path == "/truncated"_str) {
+                EXPECT_TRUE((co_await traffic_read(response.body)).is_err());
+            } else {
+                while (observer.snapshot().body_progress.body_received_bytes.unwrap_or(u64()) <
+                       u64(8))
+                    co_await rstd::async::yield_now();
+                EXPECT_EQ(observer.snapshot().body_progress.body_received_bytes, Some(u64(8)));
+                response.body.cancel();
+            }
+            auto report = (co_await observer.wait()).unwrap();
+            EXPECT_TRUE(report.transfer->logical.result.is_err());
+            EXPECT_EQ(report.facts.body_progress.body_sent_bytes, Some(u64(3)));
+            EXPECT_EQ(report.facts.body_progress.body_received_bytes,
+                      Some(path == "/truncated"_str ? u64(2) : u64(8)));
+            EXPECT_EQ(observer.snapshot().body_progress.body_received_bytes,
+                      report.facts.body_progress.body_received_bytes);
+        }
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
+TEST(Peer, BodyTrafficObserverSurvivesIndependentNativeAttemptAndClose) {
+    if (! ::getenv("LIFETCHTO_PEER_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        http::BodyTrafficObserver observer;
+        EXPECT_TRUE(observer.snapshot().body_sent_bytes.is_none());
+        auto engine   = Engine::make(runtime.handle()).unwrap();
+        auto native   = http::NativeBackend::make(engine.resources()).unwrap();
+        auto request  = traffic_request(url("/echo"_str).as_str());
+        auto prepared = native.prepare(rstd::move(request.parts), request.body.metadata()).unwrap();
+        auto body =
+            http::UploadBody(lifetchto::UploadBody::bytes(Bytes::copy_from_slice("abc"_bytes)));
+        auto operation =
+            native.operation({ rstd::move(prepared), rstd::move(body), Some(observer.clone()) })
+                .unwrap();
+        EXPECT_EQ(observer.snapshot().body_sent_bytes, Some(u64()));
+        auto transfer = engine.submit(rstd::move(operation)).unwrap();
+        auto response = (co_await transfer.output()).unwrap();
+        EXPECT_EQ((co_await traffic_read(response.body)).unwrap(), usize(3));
+        EXPECT_TRUE((co_await transfer.control().wait())->logical.result.is_ok());
+        EXPECT_TRUE((co_await native.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        EXPECT_EQ(observer.snapshot().body_sent_bytes, Some(u64(3)));
+        EXPECT_EQ(observer.snapshot().body_received_bytes, Some(u64(3)));
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
+TEST(Peer, BodyTrafficRetainsConfirmedUploadWhenLaterSourceFails) {
+    if (! ::getenv("LIFETCHTO_PEER_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        auto engine = Engine::make(runtime.handle()).unwrap();
+        auto native = http::NativeBackend::make(engine.resources()).unwrap();
+        auto client =
+            http::Client::make(engine.handle(), http::BackendBinding::Owned(native.backend()))
+                .unwrap();
+        http::ExecutionObserver observer;
+        http::ExecuteOptions    options;
+        options.report = Some(observer.clone());
+        auto request   = traffic_request(url("/echo"_str).as_str());
+        request.body =
+            http::UploadPlan::once(lifetchto::UploadBody::from_source(TrafficSourceFailure {}));
+        auto transfer = client.execute(rstd::move(request), rstd::move(options)).unwrap();
+        EXPECT_TRUE((co_await transfer.output()).is_err());
+        auto report = (co_await observer.wait()).unwrap();
+        EXPECT_TRUE(report.transfer->logical.result.is_err());
+        EXPECT_EQ(report.facts.body_progress.body_sent_bytes, Some(u64(3)));
+        EXPECT_EQ(report.facts.body_progress.body_received_bytes, Some(u64()));
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
 TEST(Peer, FramingAndStreaming) {
     if (! ::getenv("LIFETCHTO_PEER_PORT")) GTEST_SKIP();
     auto runtime = rstd::async::RuntimeBuilder::multi_thread()

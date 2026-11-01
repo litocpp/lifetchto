@@ -356,6 +356,8 @@ TEST(HttpPolicy, RetryReusesPreparationAndRoutingAndReportsEachAttempt) {
         auto report = (co_await observer.wait()).unwrap();
         EXPECT_EQ(report.facts.attempts, usize(2));
         EXPECT_EQ(report.transfer->progress.attempts, usize(2));
+        EXPECT_TRUE(report.facts.body_progress.body_sent_bytes.is_none());
+        EXPECT_TRUE(report.facts.body_progress.body_received_bytes.is_none());
         EXPECT_EQ(script->lock().unwrap()->prepared, usize(1));
         EXPECT_EQ(script->lock().unwrap()->selected, usize(1));
         EXPECT_TRUE((co_await client.close()).is_ok());
