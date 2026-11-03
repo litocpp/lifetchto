@@ -68,6 +68,23 @@ struct Connection {
 #endif
         return io_result(tcp->send(rstd::move(bytes)));
     }
+    auto flush() -> coro<Result<empty>> {
+#if LITO_FEAT_TLS
+        if (tls.is_some()) co_return co_await tls_result(tls->flush());
+#endif
+#if RSTD_OS_UNIX
+        if (unix.is_some()) co_return Ok(empty {});
+#endif
+        co_return co_await io_result(tcp->flush());
+    }
+    auto send_confirmed(Bytes bytes) -> coro<Result<usize>> {
+        auto sent = co_await send_some(rstd::move(bytes));
+        if (sent.is_err()) co_return Err(rstd::move(sent).unwrap_err());
+        // TLS accepting plaintext does not confirm its encrypted transport output.
+        auto flushed = co_await flush();
+        if (flushed.is_err()) co_return Err(rstd::move(flushed).unwrap_err());
+        co_return rstd::move(sent);
+    }
     auto send_body(Bytes bytes, Arc<BodyState> body, usize payload_offset, usize payload_length)
         -> coro<Result<usize>> {
         auto length = bytes.len();
@@ -261,11 +278,12 @@ auto connect_tcp(rstd::net::SocketAddr                address,
     if (adapted.is_err()) co_return Err(Error::Connect(adapted.unwrap_err()));
     co_return Ok(rstd::move(*adapted));
 }
-auto connect_to(Arc<NativeState>     client,
-                Arc<Slot>            slot,
-                const lihttpto::Url& url,
-                Arc<BodyState>       body,
-                bool                 force_tunnel = false) -> coro<Result<Connection>> {
+auto connect_native(Arc<NativeState>     client,
+                    Arc<Slot>            slot,
+                    const lihttpto::Url& url,
+                    Arc<BodyState>       body,
+                    bool                 force_tunnel = false) -> coro<Result<Connection>> {
+    body->set_connect_stage(ConnectStage::Dial);
     auto deadline = connect_deadline(client->options, *body);
     {
         auto f = body->fields.lock().unwrap();
@@ -371,6 +389,7 @@ auto connect_to(Arc<NativeState>     client,
     if (connection.tcp.is_none())
         co_return Err(last.is_some() ? last.take().unwrap() : Error::Capacity());
     if (slot->proxy.is_some() && (force_tunnel || origin.scheme == "https"_str)) {
+        body->set_connect_stage(ConnectStage::ProxyConnect);
         auto tunnel =
             co_await proxy_tunnel(connection, url, body.clone(), deadline, client->options);
         if (tunnel.is_err()) {
@@ -379,6 +398,7 @@ auto connect_to(Arc<NativeState>     client,
         }
     }
     if (origin.scheme.as_str() == "https"_str) {
+        body->set_connect_stage(ConnectStage::Tls);
         if (! connection.pending.is_empty()) {
             (void)co_await connection.close();
             co_return Err(protocol_error("unexpected data before tunneled TLS handshake"_Str));
@@ -430,5 +450,18 @@ auto connect_to(Arc<NativeState>     client,
 #endif
     }
     co_return Ok(rstd::move(connection));
+}
+auto connect_to(Arc<NativeState>     client,
+                Arc<Slot>            slot,
+                const lihttpto::Url& url,
+                Arc<BodyState>       body,
+                bool                 force_tunnel = false) -> coro<Result<Connection>> {
+    auto progress = body.clone();
+    auto result   = co_await connect_native(
+        rstd::move(client), rstd::move(slot), url, rstd::move(body), force_tunnel);
+    if (result.is_err())
+        co_return Err(connect_failure(rstd::move(result).unwrap_err(),
+                                      ConnectProgress { progress->connect_stage() }));
+    co_return rstd::move(result);
 }
 } // namespace lifetchto::http

@@ -14,6 +14,7 @@ import time
 import h2.config
 import h2.connection
 import h2.events
+import h2.settings
 from hyperframe.frame import GoAwayFrame
 
 
@@ -21,9 +22,13 @@ class Peer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, context, bad_settings=False):
+    def __init__(self, context, bad_settings=False, stall_tls=False, stall_settings=False,
+                 stream_window=None):
         self.context = context
         self.bad_settings = bad_settings
+        self.stall_tls = stall_tls
+        self.stall_settings = stall_settings
+        self.stream_window = stream_window
         self.events = []
         self.lock = threading.Lock()
         self.sequence = 0
@@ -40,6 +45,11 @@ class Handler(socketserver.BaseRequestHandler):
             self.server.sequence += 1
             identity = self.server.sequence
         try:
+            if self.server.stall_tls:
+                self.request.settimeout(4)
+                while self.request.recv(65536):
+                    pass
+                return
             sock = self.server.context.wrap_socket(self.request, server_side=True)
             sock.settimeout(4)
             self.server.event(connection=identity, alpn=sock.selected_alpn_protocol())
@@ -53,8 +63,15 @@ class Handler(socketserver.BaseRequestHandler):
                         message += data
                     sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
                 return
+            if self.server.stall_settings:
+                while sock.recv(65536):
+                    pass
+                return
             conn = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=False, validate_inbound_headers=False))
             conn.initiate_connection()
+            if self.server.stream_window is not None:
+                conn.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE:
+                                      self.server.stream_window})
             initial = conn.data_to_send()
             if self.server.bad_settings:
                 initial = bytes.fromhex("000006040000000000000200000001")
@@ -69,6 +86,9 @@ class Handler(socketserver.BaseRequestHandler):
             trailers = set()
             tunnels = set()
             tunnel_ended = set()
+            tunnel_terminal = set()
+            tunnel_started = set()
+            split_reset = None
             goaway = False
             close_mode = "notify"
             while True:
@@ -115,6 +135,62 @@ class Handler(socketserver.BaseRequestHandler):
                     elif isinstance(event, h2.events.DataReceived):
                         if event.stream_id in tunnels:
                             sid = event.stream_id
+                            authority = requests[sid][2][b":authority"]
+                            if authority.startswith(b"control"):
+                                requests[sid][1].extend(event.data)
+                                while b"\n" in requests[sid][1]:
+                                    command, _, remaining = requests[sid][1].partition(b"\n")
+                                    requests[sid][1] = bytearray(remaining)
+                                    if command == b"reset-split":
+                                        if split_reset is None:
+                                            raise AssertionError("missing split reset target")
+                                        conn.reset_stream(split_reset, error_code=0)
+                                        tunnel_terminal.add(split_reset)
+                                        self.server.event(connection=identity,
+                                                          clean_reset=split_reset, batch=False)
+                                    pending[sid] = pending.get(sid, b"") + command + b"\n"
+                                conn.acknowledge_received_data(event.flow_controlled_length, sid)
+                                continue
+                            if authority.startswith(b"clean-partial"):
+                                requests[sid][1].extend(event.data)
+                                if len(requests[sid][1]) == self.server.stream_window:
+                                    conn.send_data(sid, b"done", end_stream=True)
+                                    conn.reset_stream(sid, error_code=0)
+                                    tunnel_terminal.add(sid)
+                                    self.server.event(connection=identity, clean_reset=sid,
+                                                      upload=len(requests[sid][1]), batch=True)
+                                elif len(requests[sid][1]) > self.server.stream_window:
+                                    raise AssertionError("upload exceeded withheld stream credit")
+                                continue
+                            if authority.startswith((b"clean-batch", b"clean-split",
+                                                     b"reset-zero", b"end-reset-error")):
+                                requests[sid][1].extend(event.data)
+                                conn.acknowledge_received_data(event.flow_controlled_length, sid)
+                                if sid in tunnel_started or len(requests[sid][1]) < 2:
+                                    continue
+                                tunnel_started.add(sid)
+                                if authority.startswith(b"clean-batch"):
+                                    conn.send_data(sid, b"first-")
+                                    conn.send_data(sid, b"second")
+                                    conn.send_data(sid, b"-last", end_stream=True)
+                                    conn.reset_stream(sid, error_code=0)
+                                    tunnel_terminal.add(sid)
+                                    self.server.event(connection=identity, clean_reset=sid,
+                                                      batch=True)
+                                elif authority.startswith(b"clean-split"):
+                                    conn.send_data(sid, b"split-body", end_stream=True)
+                                    split_reset = sid
+                                else:
+                                    code = 0 if authority.startswith(b"reset-zero") else 7
+                                    if code:
+                                        conn.send_data(sid, b"", end_stream=True)
+                                    conn.reset_stream(sid, error_code=code)
+                                    tunnel_terminal.add(sid)
+                                continue
+                            if authority.startswith(b"reset-after"):
+                                conn.acknowledge_received_data(event.flow_controlled_length, sid)
+                                conn.reset_stream(sid, error_code=7)
+                                continue
                             if not requests[sid][2][b":authority"].startswith(b"half"):
                                 pending[sid] = pending.get(sid, b"") + event.data
                         else:
@@ -127,7 +203,7 @@ class Handler(socketserver.BaseRequestHandler):
                         sid = event.stream_id
                         if sid in tunnels:
                             tunnel_ended.add(sid)
-                            if not requests[sid][2][b":authority"].startswith(b"half"):
+                            if sid not in tunnel_terminal and not requests[sid][2][b":authority"].startswith(b"half"):
                                 pending.setdefault(sid, b"")
                             continue
                         target, upload, fields = requests[sid]
@@ -228,15 +304,22 @@ def main():
     args.work_dir.mkdir(parents=True, exist_ok=True)
     cert, key = certificate(args.work_dir)
     peers = []
-    for protocols, bad in ((["h2", "http/1.1"], False), (["http/1.1"], False), (["h2"], True)):
+    for protocols, bad, stall_tls, stall_settings, window in (
+            (["h2", "http/1.1"], False, False, False, None),
+            (["http/1.1"], False, False, False, None), (["h2"], True, False, False, None),
+            (["h2"], False, True, False, None), (["h2"], False, False, True, None),
+            (["h2"], False, False, False, 1024)):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(cert, key)
         context.set_alpn_protocols(protocols)
-        peer = Peer(context, bad)
+        peer = Peer(context, bad, stall_tls, stall_settings, window)
         peers.append(peer)
         threading.Thread(target=peer.serve_forever, daemon=True).start()
     env = dict(os.environ, LIFETCHTO_H2_PORT=str(peers[0].server_address[1]),
-               LIFETCHTO_H1_PORT=str(peers[1].server_address[1]), LIFETCHTO_H2_BAD_PORT=str(peers[2].server_address[1]), LIFETCHTO_H2_CA=str(cert))
+               LIFETCHTO_H1_PORT=str(peers[1].server_address[1]), LIFETCHTO_H2_BAD_PORT=str(peers[2].server_address[1]), LIFETCHTO_H2_CA=str(cert),
+               LIFETCHTO_H2_TLS_STALL_PORT=str(peers[3].server_address[1]),
+               LIFETCHTO_H2_SETTINGS_STALL_PORT=str(peers[4].server_address[1]))
+    env["LIFETCHTO_H2_WINDOW_PORT"] = str(peers[5].server_address[1])
     try:
         result = subprocess.run([str(args.binary), "--gtest_filter=" + args.filter], env=env, timeout=90)
     finally:

@@ -30,6 +30,7 @@ public:
     auto operator=(PendingTunnel&&) noexcept -> PendingTunnel&;
     ~PendingTunnel();
     auto connected() const -> coro<Result<TunnelConnection>>;
+    auto progress() const -> ConnectProgress;
     void request_stop() const;
     auto close() const -> coro<Result<empty>>;
 };

@@ -8,6 +8,7 @@ using rstd::sync::Arc;
 using rstd::async::coro;
 using rstd::bytes::Bytes;
 struct BodyFields {
+    ConnectStage                   connect_stage { ConnectStage::Dial };
     Option<lihttpto::ResponseHead> head;
     Option<ByteQueue>              queue;
     Option<lihttpto::Headers>      trailers;
@@ -34,6 +35,14 @@ struct BodyState {
         : deadline(deadline), body_progress(rstd::move(traffic)) {
         if (body_progress.is_some()) body_progress->initialize();
     }
+    void set_connect_stage(ConnectStage stage) const {
+        {
+            auto f           = fields.lock().unwrap();
+            f->connect_stage = stage;
+        }
+        changed.notify();
+    }
+    auto connect_stage() const -> ConnectStage { return fields.lock().unwrap()->connect_stage; }
     void sent_body(usize count) const {
         if (body_progress.is_some()) body_progress->sent(count);
     }

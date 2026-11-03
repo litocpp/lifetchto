@@ -93,7 +93,17 @@ TEST(TcpConnector, FailedFinishAndHandoffAwaitClose) {
             auto result =
                 co_await client.send(TestRequest::make(url.as_ref()).unwrap(), rstd::move(options));
             EXPECT_TRUE(result.is_err());
-            if (result.is_err()) EXPECT_TRUE(result.unwrap_err().is_Unsupported());
+            if (result.is_err()) {
+                auto error = rstd::move(result).unwrap_err();
+                EXPECT_TRUE(error.is_Unsupported());
+                EXPECT_TRUE(error.context().is_some());
+                if (error.context().is_some()) {
+                    auto phase =
+                        rstd::error::downcast_ref<http::ConnectFailure>(error.context()->deref());
+                    EXPECT_TRUE(phase.is_some());
+                    if (phase.is_some()) EXPECT_EQ((*phase)->stage, http::ConnectStage::Dial);
+                }
+            }
             EXPECT_TRUE((co_await client.close()).is_ok());
             EXPECT_EQ(stats->lock().unwrap()->closes, usize(1));
             EXPECT_EQ(stats->lock().unwrap()->released, usize(1));

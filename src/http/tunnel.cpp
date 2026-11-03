@@ -17,19 +17,29 @@ struct TunnelWrite {
 struct TunnelFields {
     Option<lihttpto::ResponseHead> head;
     Option<Error>                  error, cleanup_error;
+    Option<ResourcePermit>         permit;
+    Option<ConnectStage>           stage;
+    u32                            stream_id {};
     Vec<Bytes>                     incoming;
     usize                          buffered {}, consumed {};
     Option<TunnelWrite>            write;
     bool reading {}, writing {}, stopping {}, released {}, transferred {}, claimed {},
-        remote_end {}, local_end {}, shutdown_requested {}, shutdown_done {};
+        remote_end {}, local_end {}, shutdown_requested {}, shutdown_done {}, graceful_reset {};
+    void stop() {
+        stopping = true;
+        incoming = {};
+        buffered = usize();
+        if (released) permit = None();
+    }
 };
 struct TunnelStreamState {
     rstd::sync::Mutex<TunnelFields> fields { TunnelFields {} };
     Event                           changed, connection_changed;
     lihttpto::h2::Request           request;
-    Option<ResourcePermit>          permit;
     Instant                         deadline;
     usize                           upload_window;
+    u64                             session_id;
+    Arc<BodyState>                  connection;
     u32                             id {};
     u64                             last_serial {};
     bool                            reset {};
@@ -37,27 +47,52 @@ struct TunnelStreamState {
     TunnelStreamState(lihttpto::h2::Request   request,
                       ResourcePermit          permit,
                       Event                   event,
-                      const TransportOptions& options)
+                      const TransportOptions& options,
+                      u64                     session_id,
+                      Arc<BodyState>          connection)
         : connection_changed(rstd::move(event)),
           request(rstd::move(request)),
-          permit(Some(rstd::move(permit))),
           deadline(Instant::now() + options.connect_timeout),
-          upload_window(options.upload_window) {}
+          upload_window(options.upload_window),
+          session_id(session_id),
+          connection(rstd::move(connection)) {
+        fields.lock().unwrap()->permit = Some(rstd::move(permit));
+    }
+    auto progress() const -> ConnectProgress {
+        Option<ConnectStage> stage;
+        u32                  stream;
+        {
+            auto f = fields.lock().unwrap();
+            stage  = f->stage;
+            stream = f->stream_id;
+        }
+        return { stage.unwrap_or(connection->connect_stage()), session_id, stream };
+    }
     void notify() const {
         changed.notify();
         connection_changed.notify();
     }
     void stop() const {
         {
-            auto f      = fields.lock().unwrap();
-            f->stopping = true;
+            auto f = fields.lock().unwrap();
+            f->stop();
         }
         notify();
     }
     void fail(Error error) const {
+        auto context       = failure_progress(error, progress());
+        context.session_id = session_id;
+        {
+            auto f            = fields.lock().unwrap();
+            context.stream_id = f->stream_id;
+        }
+        auto annotated = connect_failure(rstd::move(error), context);
         {
             auto f = fields.lock().unwrap();
-            if (f->error.is_none()) f->error = Some(rstd::move(error));
+            if (f->error.is_none()) {
+                f->error = Some(rstd::move(annotated));
+                f->stage = Some(context.stage);
+            }
             f->stopping = true;
         }
         notify();
@@ -71,13 +106,14 @@ struct TunnelSessionFields {
     explicit TunnelSessionFields(usize limit): peer_limit(limit) {}
 };
 struct TunnelSession {
+    u64                                    id;
     rstd::sync::Mutex<TunnelSessionFields> fields;
     Event                                  changed;
     Arc<BodyState>                         connecting { Arc<BodyState>::make(None<Instant>()) };
     Option<TaskControl>                    task;
     Option<ResourcePermit>                 permit;
-    explicit TunnelSession(usize limit, ResourcePermit permit)
-        : fields(TunnelSessionFields(limit)), permit(Some(rstd::move(permit))) {}
+    explicit TunnelSession(u64 id, usize limit, ResourcePermit permit)
+        : id(id), fields(TunnelSessionFields(limit)), permit(Some(rstd::move(permit))) {}
     void stop() const {
         {
             auto f     = fields.lock().unwrap();
@@ -91,6 +127,7 @@ struct TunnelSession {
 struct TunnelPoolFields {
     Vec<Arc<TunnelSession>> sessions;
     usize                   handles { 1 };
+    u64                     next_session_id { 1 };
     bool                    closed {};
 };
 struct TunnelPool {
@@ -117,7 +154,12 @@ struct TunnelPool {
     }
 };
 auto tunnel_io_error(const Error& error) -> rstd::io::Error {
-    if (error.is_Connect()) return error.as_Connect().cause;
+    if (error.is_Connect()) {
+        if (error.context().is_none()) return error.as_Connect().cause;
+        return rstd::io::Error::with_source(
+            error.as_Connect().cause.kind(),
+            Arc<rstd::dyn<rstd::error::Error>>::make(error.clone()));
+    }
     auto kind = rstd::io::ErrorKind::ConnectionReset;
     if (error.is_Timeout())
         kind = rstd::io::ErrorKind::TimedOut;
@@ -129,8 +171,8 @@ auto tunnel_io_error(const Error& error) -> rstd::io::Error {
         kind = rstd::io::ErrorKind::ResourceBusy;
     else if (error.is_Capacity())
         kind = rstd::io::ErrorKind::OutOfMemory;
-    return rstd::io::Error::make_const(rstd::io::ErrorKind { kind },
-                                       "HTTP/2 tunnel operation failed");
+    return rstd::io::Error::with_source(rstd::io::ErrorKind { kind },
+                                        Arc<rstd::dyn<rstd::error::Error>>::make(error.clone()));
 }
 struct TunnelOperation {
     Arc<TunnelStreamState> stream;
@@ -142,7 +184,7 @@ struct TunnelOperation {
                 f->reading = false;
             else
                 f->writing = false;
-            if (armed && stop_on_drop) f->stopping = true;
+            if (armed && stop_on_drop) f->stop();
         }
         stream->notify();
     }
@@ -174,6 +216,7 @@ auto tunnel_read(Arc<TunnelPool> pool, Arc<TunnelStreamState> stream, rstd::byte
                 if (bytes.is_empty()) f->incoming.remove(usize());
                 f->buffered -= count;
                 f->consumed += count;
+                if (f->released && f->buffered == usize()) f->permit = None();
                 operation.armed = false;
                 stream->connection_changed.notify();
                 co_return rstd::async::io::StreamReceive { Ok(count), rstd::move(buffer) };
@@ -225,9 +268,11 @@ auto tunnel_send(Arc<TunnelPool> pool, Arc<TunnelStreamState> stream, Bytes byte
             auto& write = *f->write;
             if (write.done || f->released) {
                 auto count = write.confirmed;
-                auto error = f->error.is_some() ? tunnel_io_error(*f->error)
-                                                : rstd::io::Error::from_kind(rstd::io::ErrorKind {
-                                                      rstd::io::ErrorKind::Interrupted });
+                auto error = f->error.is_some()
+                                 ? tunnel_io_error(*f->error)
+                                 : rstd::io::Error::from_kind(rstd::io::ErrorKind {
+                                       f->graceful_reset ? rstd::io::ErrorKind::BrokenPipe
+                                                         : rstd::io::ErrorKind::Interrupted });
                 if (write.done || f->released) f->write = None();
                 operation.armed = false;
                 if (count != usize()) co_return Ok(count);
@@ -249,9 +294,13 @@ auto tunnel_flush(Arc<TunnelPool> pool, Arc<TunnelStreamState> stream, bool shut
         if (f->stopping)
             co_return Err(rstd::io::Error::from_kind(
                 rstd::io::ErrorKind { rstd::io::ErrorKind::Interrupted }));
-        if (! shutdown || f->shutdown_done) co_return Ok(empty {});
-        f->writing            = true;
-        f->shutdown_requested = true;
+        if (f->graceful_reset) {
+            if (f->released) co_return Ok(empty {});
+        } else {
+            if (! shutdown || f->shutdown_done) co_return Ok(empty {});
+            f->shutdown_requested = true;
+        }
+        f->writing = true;
     }
     TunnelOperation operation { stream.clone(), false };
     stream->connection_changed.notify();
@@ -259,10 +308,6 @@ auto tunnel_flush(Arc<TunnelPool> pool, Arc<TunnelStreamState> stream, bool shut
         auto event = stream->changed.listen();
         {
             auto f = stream->fields.lock().unwrap();
-            if (f->shutdown_done) {
-                operation.armed = false;
-                co_return Ok(empty {});
-            }
             if (f->error.is_some()) {
                 operation.armed = false;
                 co_return Err(tunnel_io_error(*f->error));
@@ -271,6 +316,10 @@ auto tunnel_flush(Arc<TunnelPool> pool, Arc<TunnelStreamState> stream, bool shut
                 operation.armed = false;
                 co_return Err(rstd::io::Error::from_kind(
                     rstd::io::ErrorKind { rstd::io::ErrorKind::Interrupted }));
+            }
+            if (f->graceful_reset ? f->released : f->shutdown_done) {
+                operation.armed = false;
+                co_return Ok(empty {});
             }
         }
         co_await rstd::move(event);
@@ -430,7 +479,10 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
     else
         native = Some(rstd::move(connected).unwrap());
     if (native.is_some() && ! native->http2)
-        fatal = Some(Error::Unsupported("CONNECT tunnels require negotiated h2"_Str));
+        fatal =
+            Some(connect_failure(Error::Unsupported("CONNECT tunnels require negotiated h2"_Str),
+                                 ConnectProgress { ConnectStage::Tls, owner->id }));
+    if (fatal.is_none()) owner->connecting->set_connect_stage(ConnectStage::Http2Settings);
     lihttpto::h2::Limits limits;
     limits.header_bytes          = pool->native->options.head_limit;
     limits.maximum_streams       = pool->native->options.max_http2_streams;
@@ -485,7 +537,8 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
             break;
         }
         if (! protocol->established() && now >= settings_deadline) {
-            fatal = Some(Error::Timeout());
+            fatal = Some(connect_failure(
+                Error::Timeout(), ConnectProgress { ConnectStage::Http2Settings, owner->id }));
             break;
         }
         if (io.written.is_some()) {
@@ -535,6 +588,9 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
                 break;
             }
         }
+        if (protocol->established() &&
+            owner->connecting->connect_stage() == ConnectStage::Http2Settings)
+            owner->connecting->set_connect_stage(ConnectStage::ConnectHead);
         auto events = protocol->take_events();
         for (auto& item : events) {
             progress = true;
@@ -550,8 +606,9 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
                             Arc<rstd::dyn<rstd::error::Error>>::make(rstd::move(failure))));
                     } else {
                         {
-                            auto f  = s->fields.lock().unwrap();
-                            f->head = Some(rstd::move(head));
+                            auto f   = s->fields.lock().unwrap();
+                            f->head  = Some(rstd::move(head));
+                            f->stage = Some(ConnectStage::TunnelIo);
                         }
                         s->changed.notify();
                     }
@@ -586,6 +643,23 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
                 RSTD_CASE(Reset, stream, code) {
                     auto* s = find(stream);
                     if (! s) break;
+                    bool graceful;
+                    {
+                        auto f   = s->fields.lock().unwrap();
+                        graceful = code == u32() && f->remote_end &&
+                                   (f->head.is_some() || f->transferred) && f->error.is_none() &&
+                                   ! f->stopping;
+                        if (graceful) {
+                            f->graceful_reset = true;
+                            f->local_end      = true;
+                        }
+                    }
+                    if (graceful) {
+                        s->reset         = true;
+                        s->stop_deadline = Some(now + pool->native->options.tls_close_timeout);
+                        s->changed.notify();
+                        break;
+                    }
                     s->fail(http2_error(lihttpto::h2::Error::Stream(stream, code)));
                     break;
                 }
@@ -614,7 +688,10 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
                 auto f = s->fields.lock().unwrap();
                 if (f->head.is_none() && ! f->transferred && f->error.is_none()) {
                     if (now >= s->deadline) {
-                        f->error    = Some(Error::Timeout());
+                        auto stage  = f->stage.unwrap_or(owner->connecting->connect_stage());
+                        f->error    = Some(connect_failure(
+                            Error::Timeout(), ConnectProgress { stage, owner->id, s->id }));
+                        f->stage    = Some(stage);
                         f->stopping = true;
                     } else
                         wake(s->deadline);
@@ -639,7 +716,11 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
             if (! stopping && s->id == u32() && protocol->accepting()) {
                 auto opened = protocol->open(s->request);
                 if (opened.is_ok()) {
-                    s->id      = *opened;
+                    s->id = *opened;
+                    {
+                        auto f       = s->fields.lock().unwrap();
+                        f->stream_id = s->id;
+                    }
                     s->request = {};
                     progress   = true;
                 }
@@ -655,7 +736,9 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
                             auto sent = protocol->send(
                                 s->id, write.bytes.slice(write.queued, write.queued + count));
                             if (sent.is_err()) {
-                                f->error    = Some(http2_error(rstd::move(sent).unwrap_err()));
+                                f->error    = Some(connect_failure(
+                                    http2_error(rstd::move(sent).unwrap_err()),
+                                    ConnectProgress { ConnectStage::TunnelIo, owner->id, s->id }));
                                 f->stopping = true;
                             } else {
                                 write.queued += count;
@@ -666,7 +749,9 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
                     if (f->shutdown_requested && ! f->local_end && f->write.is_none()) {
                         auto sent = protocol->send(s->id, Bytes {}, true);
                         if (sent.is_err()) {
-                            f->error    = Some(http2_error(rstd::move(sent).unwrap_err()));
+                            f->error    = Some(connect_failure(
+                                http2_error(rstd::move(sent).unwrap_err()),
+                                ConnectProgress { ConnectStage::TunnelIo, owner->id, s->id }));
                             f->stopping = true;
                         } else {
                             f->local_end = true;
@@ -697,9 +782,12 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
                        completed >= s->last_serial;
                 if (done) {
                     f->released = true;
-                    f->incoming = {};
-                    f->buffered = usize();
+                    if (! f->graceful_reset || f->stopping) {
+                        f->incoming = {};
+                        f->buffered = usize();
+                    }
                     if (f->write.is_some()) f->write->bytes = {};
+                    if (f->buffered == usize()) f->permit = None();
                 }
             }
             if (! done) {
@@ -707,7 +795,6 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
                 continue;
             }
             if (s->id != u32()) protocol->forget(s->id);
-            s->permit = None();
             s->changed.notify();
             streams.remove(i);
             progress = true;
@@ -735,7 +822,7 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
         if (current.is_none() && ! outgoing.is_empty()) current = Some(outgoing.remove(usize()));
         if (io.write.is_none() && current.is_some())
             io.write = Some(native
-                                ->send_some(current->output.bytes.slice(
+                                ->send_confirmed(current->output.bytes.slice(
                                     current->offset, current->output.bytes.len()))
                                 .into_future());
         if (io.read.is_none()) io.read = Some(native->recv(usize(16384)).into_future());
@@ -762,18 +849,20 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
     {
         auto f = owner->fields.lock().unwrap();
         for (const auto& s : f->streams) {
+            s->fail(fatal.is_some() ? fatal->clone() : Error::Closed());
             {
-                auto b = s->fields.lock().unwrap();
-                if (b->error.is_none())
-                    b->error = Some(fatal.is_some() ? fatal->clone() : Error::Closed());
+                auto b      = s->fields.lock().unwrap();
                 b->released = true;
                 b->stopping = true;
-                if (cleanup.is_some()) b->cleanup_error = Some(cleanup->clone());
+                if (cleanup.is_some())
+                    b->cleanup_error = Some(connect_failure(
+                        cleanup->clone(),
+                        ConnectProgress { ConnectStage::TunnelIo, owner->id, s->id }));
                 b->incoming = {};
                 b->buffered = usize();
                 if (b->write.is_some()) b->write->bytes = {};
+                b->permit = None();
             }
-            s->permit = None();
             s->notify();
         }
         f->streams.clear();
@@ -849,6 +938,9 @@ auto tunnel_connected(Arc<TunnelPool> pool, Arc<TunnelStreamState> state)
 }
 auto PendingTunnel::connected() const -> coro<Result<TunnelConnection>> {
     return tunnel_connected(pool_.clone(), state_.clone());
+}
+auto PendingTunnel::progress() const -> ConnectProgress {
+    return state_->progress();
 }
 TunnelClient::TunnelClient(Arc<TunnelPool> pool, Arc<ResourceLease<empty>> registration)
     : pool_(rstd::move(pool)), registration_(rstd::move(registration)) {
@@ -961,15 +1053,20 @@ auto TunnelClient::open(String authority, Vec<lihttpto::h2::Field> fields) const
             return Err(Error::Busy());
         auto permit = pool_->resources.try_reserve(ResourceAmount { .resources = usize(1) });
         if (permit.is_err()) return Err(rstd::move(permit).unwrap_err());
-        auto session =
-            Arc<TunnelSession>::make(pool_->native->options.max_http2_streams, rstd::move(*permit));
+        if (f->next_session_id == u64::MAX) return Err(Error::Capacity());
+        auto session = Arc<TunnelSession>::make(
+            f->next_session_id++, pool_->native->options.max_http2_streams, rstd::move(*permit));
         f->sessions.push(session.clone());
         choice = Some(rstd::move(session));
     }
 
     auto selected = choice.take().unwrap();
-    auto state    = Arc<TunnelStreamState>::make(
-        rstd::move(*request), rstd::move(*permit), selected->changed.clone(), options);
+    auto state    = Arc<TunnelStreamState>::make(rstd::move(*request),
+                                                 rstd::move(*permit),
+                                                 selected->changed.clone(),
+                                                 options,
+                                                 selected->id,
+                                                 selected->connecting.clone());
     {
         auto s = selected->fields.lock().unwrap();
         s->streams.push(state.clone());
@@ -986,8 +1083,8 @@ auto TunnelClient::open(String authority, Vec<lihttpto::h2::Field> fields) const
             {
                 auto s      = state->fields.lock().unwrap();
                 s->released = true;
+                s->permit   = None();
             }
-            state->permit    = None();
             selected->permit = None();
             return Err(state->fields.lock().unwrap()->error->clone());
         }

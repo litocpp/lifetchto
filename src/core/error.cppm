@@ -32,8 +32,9 @@ class Error {
               (ReplayUnavailable),
               (AttemptsExhausted),
               (CacheMiss))
-public:
-    auto clone() const -> Error {
+private:
+    Option<Arc<rstd::dyn<rstd::error::Error>>> context_;
+    auto                                       clone_value() const -> Error {
         if (is_InvalidOptions()) return InvalidOptions(as_InvalidOptions().message.clone());
         if (is_Unsupported()) return Unsupported(as_Unsupported().message.clone());
         if (is_Resolve()) return Resolve(as_Resolve().cause.clone());
@@ -55,6 +56,18 @@ public:
         if (is_ReplayUnavailable()) return ReplayUnavailable();
         if (is_AttemptsExhausted()) return AttemptsExhausted();
         return CacheMiss();
+    }
+
+public:
+    auto context() const -> const Option<Arc<rstd::dyn<rstd::error::Error>>>& { return context_; }
+    auto with_context(Arc<rstd::dyn<rstd::error::Error>> context) && -> Error {
+        context_ = Some(rstd::move(context));
+        return rstd::move(*this);
+    }
+    auto clone() const -> Error {
+        auto copy     = clone_value();
+        copy.context_ = context_.clone();
+        return copy;
     }
 };
 template<class T>
@@ -100,6 +113,7 @@ template<>
 struct Impl<error::Error, lifetchto::Error> : DefaultInImpl<error::Error, lifetchto::Error> {
     auto source() const noexcept -> Option<error::ErrorRef> {
         const auto& e = this->self();
+        if (e.context().is_some()) return Some(e.context()->deref());
         if (e.is_Extension()) return Some(e.as_Extension().cause.deref());
         if (e.is_Protocol() && e.as_Protocol().cause.is_some())
             return Some(e.as_Protocol().cause->deref());
