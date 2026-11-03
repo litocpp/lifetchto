@@ -9,7 +9,7 @@ link-stdlib = false
 
 [dependencies]
 lifetchto = { version = "0.1.0", features = ["http", "tls", "http2"] }
-rstd-test = { version = "0.1.9" }
-rstd-nostd = { version = "0.1.9", usage = "link" }
+rstd-test = { version = "0.1.11" }
+rstd-nostd = { version = "0.1.11", usage = "link" }
 
 liserveto = { version = "0.1.0" }

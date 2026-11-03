@@ -1,0 +1,10 @@
+<release version="0.1.0" date="2026-11-04">
+  <description>
+    <ul>
+      <li>Add Engine, Scope and Transfer with cancellation, deadlines and resource cleanup.</li>
+      <li>Add an HTTP client with streaming bodies, caching, cookies and proxy routing.</li>
+      <li>Support TLS, HTTP/2, TCP connectors and HTTP tunnels.</li>
+      <li>Keep owned operation and cleanup errors separate from diagnostic reports.</li>
+    </ul>
+  </description>
+</release>
