@@ -210,6 +210,7 @@ public:
 };
 struct NativeState;
 class NativeBackend {
+    friend class TunnelClient;
     Arc<NativeState>          state_;
     Arc<ResourceLease<empty>> registration_;
     NativeBackend(Arc<NativeState> state, Arc<ResourceLease<empty>> registration);

@@ -193,3 +193,48 @@ TEST(TcpConnector, ExplicitProxyRejectsRouteBeforeDial) {
     };
     runtime.block_on(task());
 }
+TEST(TcpConnector, EndpointRouteResolvesOnlyInsideOwnedDialAndReusesConnection) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        auto listener =
+            rstd::net::TcpListener::bind(rstd::net::SocketAddr::ipv4_loopback(u16())).unwrap();
+        auto address = listener.local_addr().unwrap();
+        auto serve   = [](rstd::net::TcpListener listener) -> coro<empty> {
+            auto accepted = (co_await listener.accept()).unwrap();
+            auto stream   = rstd::move(rstd::get<0>(accepted));
+            for (usize request; request < usize(2); ++request) {
+                auto input = (co_await stream.recv()).unwrap();
+                auto text  = rstd::str_::from_utf8(input.as_slice()).unwrap();
+                EXPECT_TRUE(text.find("unresolvable.invalid:8080"_str).is_some());
+                (co_await stream.send_all(Bytes::copy_from_slice(
+                     "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"_bytes)))
+                    .unwrap();
+            }
+            (void)co_await rstd::move(stream).close();
+            (void)co_await rstd::move(listener).close();
+            co_return empty {};
+        };
+        auto server = runtime.handle().spawn(serve(rstd::move(listener)));
+        auto stats  = test_connector::Stats::make(test_connector::Counts {});
+        auto url = lihttpto::Url::parse_http("http://unresolvable.invalid:8080/query"_str).unwrap();
+        auto provider = Arc<rstd::dyn<http::EndpointConnector>>::make(
+            test_connector::Endpoint { { address, stats.clone() } });
+        auto route = Arc<Route>::make(Route::custom(url, u64(42), rstd::move(provider)).unwrap());
+        EXPECT_TRUE(route->addresses().is_empty());
+        auto client = TestClient::make(runtime.handle()).unwrap();
+        for (usize request; request < usize(2); ++request) {
+            ExchangeOptions options;
+            options.route = Some(route.clone());
+            auto response = (co_await client.send(TestRequest::make(url.as_ref()).unwrap(),
+                                                  rstd::move(options)))
+                                .unwrap();
+            auto body     = response.take_body().unwrap();
+            EXPECT_EQ((co_await body.text(usize(10))).unwrap().as_str(), "ok"_str);
+        }
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await rstd::move(server)).is_ok());
+        EXPECT_EQ(stats->lock().unwrap()->prepared, usize(1));
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}

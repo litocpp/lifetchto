@@ -4,7 +4,7 @@ version = "0.1.0"
 
 [[test]]
 name = "lifetchto-tests"
-sources = ["main.cpp", "core.cpp", "core_session.cpp", "core_duplex.cpp", "policy.cpp", "client.cpp", "connector.cpp", "peer.cpp", "http2.cpp"]
+sources = ["main.cpp", "core.cpp", "core_session.cpp", "core_duplex.cpp", "policy.cpp", "client.cpp", "connector.cpp", "peer.cpp", "http2.cpp", "tunnel.cpp"]
 link-stdlib = false
 
 [dependencies]

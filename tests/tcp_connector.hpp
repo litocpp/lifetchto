@@ -46,7 +46,7 @@ struct Dial {
         }
         co_return Ok(empty {});
     }
-    auto into_stream() const -> lifetchto::Result<rstd::net::TcpStream> {
+    auto into_stream() const -> lifetchto::Result<rstd::async::io::Stream> {
         if (fail_take) return Err(lifetchto::Error::Unsupported("dial handoff failed"_Str));
         auto pending = connecting->lock().unwrap()->take().unwrap();
         auto result  = rstd::move(pending).into_stream();
@@ -55,7 +55,9 @@ struct Dial {
             auto f = stats->lock().unwrap();
             ++f->taken;
         }
-        return Ok(rstd::move(result).unwrap());
+        auto stream = rstd::net::as_stream(rstd::move(*result));
+        if (stream.is_err()) return Err(lifetchto::Error::Connect(stream.unwrap_err()));
+        return Ok(rstd::move(*stream));
     }
     auto close() const -> coro<lifetchto::Result<empty>> {
         {
@@ -82,6 +84,12 @@ struct Connector {
     auto       prepare(SocketAddr destination) const
         -> lifetchto::Result<Arc<rstd::dyn<lifetchto::http::TcpDial>>>;
 };
+struct Endpoint {
+    Connector connector;
+    auto      prepare() const -> lifetchto::Result<Arc<rstd::dyn<lifetchto::http::TcpDial>>> {
+        return connector.prepare(connector.physical);
+    }
+};
 } // namespace test_connector
 namespace rstd
 {
@@ -97,6 +105,11 @@ struct Impl<lifetchto::http::TcpConnector, test_connector::Connector>
     auto prepare(rstd::net::SocketAddr destination) const {
         return this->self().prepare(destination);
     }
+};
+template<>
+struct Impl<lifetchto::http::EndpointConnector, test_connector::Endpoint>
+    : ImplBase<test_connector::Endpoint> {
+    auto prepare() const { return this->self().prepare(); }
 };
 } // namespace rstd
 namespace test_connector

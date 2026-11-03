@@ -13,7 +13,7 @@ struct TcpDial {
         auto finish() const -> rstd::async::coro<Result<empty>> {
             return rstd::trait_call<0>(this);
         }
-        auto into_stream() const -> Result<rstd::net::TcpStream> {
+        auto into_stream() const -> Result<rstd::async::io::Stream> {
             return rstd::trait_call<1>(this);
         }
         auto close() const -> rstd::async::coro<Result<empty>> { return rstd::trait_call<2>(this); }
@@ -32,22 +32,36 @@ struct TcpConnector {
     template<class T>
     using Funcs = rstd::TraitFuncs<&T::prepare>;
 };
+struct EndpointConnector {
+    template<class Self, class = void>
+    struct Api {
+        using Trait = EndpointConnector;
+        auto prepare() const -> Result<Arc<rstd::dyn<TcpDial>>> {
+            return rstd::trait_call<0>(this);
+        }
+    };
+    template<class T>
+    using Funcs = rstd::TraitFuncs<&T::prepare>;
+};
 class Route {
-    String                               origin_;
-    Vec<rstd::net::SocketAddr>           addresses_;
-    Option<rstd::bytes::Bytes>           unix_;
-    u64                                  generation_;
-    Option<Arc<rstd::dyn<TcpConnector>>> connector_;
-    Route(String                               origin,
-          Vec<rstd::net::SocketAddr>           addresses,
-          Option<rstd::bytes::Bytes>           path,
-          u64                                  generation,
-          Option<Arc<rstd::dyn<TcpConnector>>> connector = {})
+    String                                    origin_;
+    Vec<rstd::net::SocketAddr>                addresses_;
+    Option<rstd::bytes::Bytes>                unix_;
+    u64                                       generation_;
+    Option<Arc<rstd::dyn<TcpConnector>>>      connector_;
+    Option<Arc<rstd::dyn<EndpointConnector>>> endpoint_connector_;
+    Route(String                                    origin,
+          Vec<rstd::net::SocketAddr>                addresses,
+          Option<rstd::bytes::Bytes>                path,
+          u64                                       generation,
+          Option<Arc<rstd::dyn<TcpConnector>>>      connector          = {},
+          Option<Arc<rstd::dyn<EndpointConnector>>> endpoint_connector = {})
         : origin_(rstd::move(origin)),
           addresses_(rstd::move(addresses)),
           unix_(rstd::move(path)),
           generation_(generation),
-          connector_(rstd::move(connector)) {}
+          connector_(rstd::move(connector)),
+          endpoint_connector_(rstd::move(endpoint_connector)) {}
 
 public:
     static auto tcp(const lihttpto::Url&                 url,
@@ -71,11 +85,22 @@ public:
             return Err(Error::Unsupported(String::make("Unix routes require HTTP and a path"_str)));
         return Ok(Route(origin->serialize(), {}, Some(rstd::move(path)), generation));
     }
+    static auto custom(const lihttpto::Url&              url,
+                       u64                               generation,
+                       Arc<rstd::dyn<EndpointConnector>> connector) -> Result<Route> {
+        auto origin = url.http_origin();
+        if (origin.is_none() || url.userinfo().is_some())
+            return Err(Error::InvalidOptions("invalid custom route origin"_Str));
+        return Ok(Route(origin->serialize(), {}, {}, generation, {}, Some(rstd::move(connector))));
+    }
     auto origin() const -> ref<str> { return origin_.as_str(); }
     auto addresses() const -> slice<rstd::net::SocketAddr> { return addresses_.as_slice(); }
     auto unix_path() const -> const Option<rstd::bytes::Bytes>& { return unix_; }
     auto generation() const -> u64 { return generation_; }
     auto connector() const -> const Option<Arc<rstd::dyn<TcpConnector>>>& { return connector_; }
+    auto endpoint_connector() const -> const Option<Arc<rstd::dyn<EndpointConnector>>>& {
+        return endpoint_connector_;
+    }
 };
 struct RouteChoice {
     Option<Arc<Route>> route;

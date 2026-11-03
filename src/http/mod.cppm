@@ -7,3 +7,4 @@ export import :response;
 export import :backend;
 export import :cache;
 export import :client;
+export import :tunnel;

@@ -69,19 +69,21 @@ struct NativeDuplexReader {
         }
     }
 };
-auto native_half_close(Connection& connection) -> Result<usize> {
+auto native_half_close(Connection& connection) -> coro<Result<usize>> {
 #if LITO_FEAT_TLS
     if (connection.tls.is_some())
-        return Err(Error::Unsupported("TLS send half-close is unavailable"_Str));
+        co_return Err(Error::Unsupported("TLS send half-close is unavailable"_Str));
 #endif
-    auto result = [&] {
 #if RSTD_OS_UNIX
-        if (connection.unix.is_some()) return connection.unix->shutdown();
+    if (connection.unix.is_some()) {
+        auto result = connection.unix->shutdown();
+        if (result.is_err()) co_return Err(Error::Connect(result.unwrap_err()));
+        co_return Ok(usize());
+    }
 #endif
-        return connection.tcp->shutdown();
-    }();
-    if (result.is_err()) return Err(Error::Connect(result.unwrap_err()));
-    return Ok(usize());
+    auto result = co_await connection.tcp->shutdown_write();
+    if (result.is_err()) co_return Err(Error::Connect(result.unwrap_err()));
+    co_return Ok(usize());
 }
 struct NativeDuplexWriter {
     Arc<NativeDuplexState> state;
@@ -94,8 +96,11 @@ struct NativeDuplexWriter {
             if (next.is_err()) co_return Ok(empty {});
             auto command = rstd::move(next).unwrap();
             if (command.is_half_close()) {
-                auto f = state->fields.lock().unwrap();
-                command.complete(native_half_close(*f->connection));
+                auto closing = [&] {
+                    auto f = state->fields.lock().unwrap();
+                    return native_half_close(*f->connection);
+                }();
+                command.complete(co_await rstd::move(closing));
                 continue;
             }
             auto writing = [&] {

@@ -53,7 +53,7 @@ class Handler(socketserver.BaseRequestHandler):
                         message += data
                     sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
                 return
-            conn = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=False))
+            conn = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=False, validate_inbound_headers=False))
             conn.initiate_connection()
             initial = conn.data_to_send()
             if self.server.bad_settings:
@@ -67,6 +67,8 @@ class Handler(socketserver.BaseRequestHandler):
             requests = {}
             pending = {}
             trailers = set()
+            tunnels = set()
+            tunnel_ended = set()
             goaway = False
             close_mode = "notify"
             while True:
@@ -81,6 +83,23 @@ class Handler(socketserver.BaseRequestHandler):
                 for event in events:
                     if isinstance(event, h2.events.RequestReceived):
                         fields = dict(event.headers)
+                        if fields.get(b":method") == b"CONNECT":
+                            sid = event.stream_id
+                            authority = fields[b":authority"]
+                            requests[sid] = ["CONNECT", bytearray(), fields]
+                            self.server.event(connection=identity, stream=sid, target="CONNECT",
+                                              authority=authority.decode())
+                            if authority.startswith(b"stall"):
+                                continue
+                            if authority.startswith(b"deny"):
+                                conn.send_headers(sid, [(b":status", b"407")], end_stream=True)
+                            else:
+                                tunnels.add(sid)
+                                conn.send_headers(sid, [(b":status", b"200"),
+                                    (b"x-connection", str(identity).encode()), (b"padding-type-reply", b"1")])
+                                if authority.startswith(b"half"):
+                                    conn.send_data(sid, b"early", end_stream=True)
+                            continue
                         target = fields[b":path"].decode()
                         if target in ("/close-eof", "/close-stall"):
                             close_mode = target
@@ -94,13 +113,23 @@ class Handler(socketserver.BaseRequestHandler):
                             if target == "/early-reset":
                                 conn.reset_stream(event.stream_id, error_code=0)
                     elif isinstance(event, h2.events.DataReceived):
-                        requests[event.stream_id][1].extend(event.data)
+                        if event.stream_id in tunnels:
+                            sid = event.stream_id
+                            if not requests[sid][2][b":authority"].startswith(b"half"):
+                                pending[sid] = pending.get(sid, b"") + event.data
+                        else:
+                            requests[event.stream_id][1].extend(event.data)
                         conn.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
                     elif isinstance(event, h2.events.TrailersReceived):
                         self.server.event(connection=identity, upload_trailers=event.stream_id,
                                           fields=[(k.decode(), v.decode()) for k, v in event.headers])
                     elif isinstance(event, h2.events.StreamEnded):
                         sid = event.stream_id
+                        if sid in tunnels:
+                            tunnel_ended.add(sid)
+                            if not requests[sid][2][b":authority"].startswith(b"half"):
+                                pending.setdefault(sid, b"")
+                            continue
                         target, upload, fields = requests[sid]
                         self.server.event(connection=identity, upload=target, size=len(upload))
                         if target in ("/early", "/early-reset"):
@@ -158,7 +187,8 @@ class Handler(socketserver.BaseRequestHandler):
                         if count == 0 and body:
                             break
                         last = count == len(body)
-                        conn.send_data(sid, body[:count], end_stream=last and sid not in trailers)
+                        end = last and sid not in trailers and (sid not in tunnels or sid in tunnel_ended)
+                        conn.send_data(sid, body[:count], end_stream=end)
                         if last:
                             pending.pop(sid)
                             if sid in trailers:
