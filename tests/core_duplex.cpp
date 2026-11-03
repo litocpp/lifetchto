@@ -37,22 +37,25 @@ struct Echo {
 };
 struct Driver {
     State state;
+    bool  manual {};
     auto  run(lf::TransferContext context, lf::OutputSender<lf::DuplexStream> output) const
         -> coro<lf::ProtocolCompletion> {
         auto channel = co_await lf::DuplexChannel::make(context.clone(), usize(8));
         if (channel.is_err())
             co_return lf::ProtocolCompletion { Err(rstd::move(channel).unwrap_err()),
                                                lf::RemoteOutcome::NotDispatched };
-        auto writer = context.resources().spawn(Echo { channel->clone() });
-        if (writer.is_err())
-            co_return lf::ProtocolCompletion { Err(rstd::move(writer).unwrap_err().error),
-                                               lf::RemoteOutcome::NotDispatched };
-        {
-            auto f     = state->lock().unwrap();
-            f->channel = Some(channel->clone());
-            f->writer  = Some(rstd::move(writer).unwrap());
+        if (! manual) {
+            auto writer = context.resources().spawn(Echo { channel->clone() });
+            if (writer.is_err())
+                co_return lf::ProtocolCompletion { Err(rstd::move(writer).unwrap_err().error),
+                                                   lf::RemoteOutcome::NotDispatched };
+            {
+                auto f    = state->lock().unwrap();
+                f->writer = Some(rstd::move(writer).unwrap());
+            }
         }
-        auto sent = output.publish(channel->take_stream().unwrap());
+        state->lock().unwrap()->channel = Some(channel->clone());
+        auto sent                       = output.publish(channel->take_stream().unwrap());
         if (sent.is_err()) channel->request_stop();
         co_return lf::ProtocolCompletion { co_await channel->wait_finished(),
                                            lf::RemoteOutcome::Unknown };
@@ -78,6 +81,46 @@ struct Driver {
     }
 };
 } // namespace
+TEST(DuplexChannel, WriteFailureHasOneOwnerEvenAfterCanceledWait) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        for (bool cancel : array<bool, 2> { false, true }) {
+            auto engine   = lf::Engine::make(runtime.handle()).unwrap();
+            auto state    = State::make(Fields {});
+            auto transfer = engine
+                                .submit(lf::PreparedOperation<lf::DuplexStream>::make(
+                                    Driver { state.clone(), true }))
+                                .unwrap();
+            auto stream   = (co_await transfer.output()).unwrap();
+            auto channel  = state->lock().unwrap()->channel->clone();
+            auto writing  = Some(stream.write(lf::Bytes::copy_from_slice("x"_bytes)).into_future());
+            auto ready    = co_await rstd::async::select(rstd::future::by_ref(*writing),
+                                                         channel.next_write().into_future());
+            EXPECT_TRUE(ready.is_right());
+            auto command = rstd::move(ready).unwrap_right().unwrap();
+            if (cancel) writing = None();
+            command.complete(Err(lf::Error::Connect(rstd::io::Error::from_raw_os_error(i32(32)))));
+            Option<lf::Error> error;
+            if (cancel)
+                error = stream.take_write_error();
+            else
+                error = Some((co_await rstd::move(*writing)).unwrap_err());
+            EXPECT_TRUE(error.is_some());
+            if (error.is_some()) {
+                EXPECT_TRUE(error->is_Connect());
+                if (error->is_Connect())
+                    EXPECT_EQ(error->as_Connect().cause.raw_os_error(), Some(i32(32)));
+            }
+            EXPECT_TRUE(stream.take_write_error().is_none());
+            EXPECT_TRUE((co_await stream.next()).is_err());
+            EXPECT_TRUE(channel.failure().is_some());
+            (void)co_await transfer.control().wait();
+            EXPECT_TRUE((co_await engine.close()).is_ok());
+        }
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
 TEST(DuplexChannel, AcknowledgesWritesAndRequiresFinishAfterEof) {
     auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
     auto task    = [&]() -> coro<empty> {
@@ -141,7 +184,9 @@ TEST(DuplexChannel, DeadlineCoversOutputAndWaitsForRelease) {
         auto read   = co_await stream.next();
         EXPECT_TRUE(read.unwrap_err().is_Timeout());
         auto report = co_await stream.completion().wait();
-        EXPECT_TRUE(report->logical.result.as_ref().unwrap_err().is_Timeout());
+        EXPECT_EQ(report->logical.result.as_ref().unwrap_err().message.as_str(),
+                  "transfer deadline expired"_str);
+        EXPECT_TRUE(transfer.take_error().unwrap().is_Timeout());
         EXPECT_EQ(state->lock().unwrap()->exits, usize(1));
         EXPECT_TRUE((co_await engine.close()).is_ok());
         co_return empty {};
@@ -166,10 +211,11 @@ TEST(DuplexChannel, CanceledReadStopsItsNativeOwnerAndEnforcesOneReader) {
             EXPECT_TRUE((co_await stream.next()).unwrap_err().is_Busy());
             EXPECT_TRUE(stream.finish().unwrap_err().is_Busy());
         }
-        EXPECT_TRUE((co_await stream.completion().wait())
-                        ->logical.result.as_ref()
-                        .unwrap_err()
-                        .is_Canceled());
+        EXPECT_EQ((co_await stream.completion().wait())
+                      ->logical.result.as_ref()
+                      .unwrap_err()
+                      .message.as_str(),
+                  "transfer canceled"_str);
         EXPECT_EQ(state->lock().unwrap()->exits, usize(1));
         EXPECT_TRUE((co_await engine.close()).is_ok());
         co_return empty {};
@@ -194,10 +240,11 @@ TEST(DuplexChannel, BackpressureExpiresAcknowledgementAndReleasesBuffers) {
             usize(8));
         auto blocked = co_await stream.write(lf::Bytes::copy_from_slice("x"_str.as_bytes()));
         EXPECT_TRUE(blocked.is_err());
-        EXPECT_TRUE((co_await stream.completion().wait())
-                        ->logical.result.as_ref()
-                        .unwrap_err()
-                        .is_Timeout());
+        EXPECT_EQ((co_await stream.completion().wait())
+                      ->logical.result.as_ref()
+                      .unwrap_err()
+                      .message.as_str(),
+                  "transfer deadline expired"_str);
         EXPECT_EQ(state->lock().unwrap()->exits, usize(1));
         EXPECT_EQ(engine.resources().usage().bytes, usize());
         EXPECT_TRUE((co_await engine.close()).is_ok());

@@ -113,7 +113,9 @@ auto perform_exchange(Arc<AttemptData> attempt, TransferContext context)
         auto event = state->changed.listen();
         {
             auto f = state->fields.lock().unwrap();
-            if (f->closed || context.cancellation().is_canceled()) co_return Err(Error::Canceled());
+            if (f->closed) co_return Err(Error::Closed());
+            if (context.cancellation().is_canceled())
+                co_return Err(stop_error(context.cancellation().reason().unwrap()));
             for (usize i; i < f->slots.len();) {
                 bool done;
                 {
@@ -157,7 +159,7 @@ auto perform_exchange(Arc<AttemptData> attempt, TransferContext context)
                     auto b = (*s->active)->fields.lock().unwrap();
                     returning =
                         returning || (b->reusable && b->finished && b->consumed && b->upload_done &&
-                                      b->upload_closed && ! b->canceled && b->error.is_none());
+                                      b->upload_closed && ! b->canceled && ! b->failed);
                 }
                 if (s->idle && ! s->closing && same_route(slot->route, route)
 #if LITO_FEAT_HTTP2
@@ -281,8 +283,8 @@ auto perform_exchange(Arc<AttemptData> attempt, TransferContext context)
             pending->request.body().cancel();
             auto closed = co_await pending->request.body().close();
             if (closed.is_err()) {
-                auto f           = body->fields.lock().unwrap();
-                f->cleanup_error = Some(rstd::move(closed).unwrap_err());
+                auto f = body->fields.lock().unwrap();
+                f->cleanup_errors.push(rstd::move(closed).unwrap_err());
             }
         }
         {
@@ -304,12 +306,13 @@ auto perform_exchange(Arc<AttemptData> attempt, TransferContext context)
                 co_return Ok(
                     ResponseMessage { f->head.take().unwrap(), native_body(body.clone()) });
             }
-            if (f->error.is_some()) co_return Err(f->error->clone());
+            if (f->error.is_some()) co_return Err(f->error.take().unwrap());
+            if (f->failed) co_return Err(Error::Closed());
             if (f->canceled) co_return Err(Error::Canceled());
         }
         auto ready =
             co_await rstd::async::select(rstd::move(event), body_stop(body.clone()).into_future());
-        if (ready.is_right()) co_return Err(rstd::move(ready).unwrap_right());
+        if (ready.is_right()) body->fail(rstd::move(ready).unwrap_right());
     }
 }
 auto join_slot(Arc<Slot> slot) -> coro<Result<empty>> {
@@ -339,22 +342,18 @@ auto close_client(Arc<NativeState> state) -> coro<Result<empty>> {
         }
     }
     for (const auto& lease : duplex) {
-        auto result = co_await lease->release();
-        if (result.is_err()) {
-            auto f = state->fields.lock().unwrap();
-            if (f->close_error.is_none()) f->close_error = Some(rstd::move(result).unwrap_err());
-        }
+        // The transfer owns the duplex cleanup result.
+        (void)co_await lease->wait_released();
     }
     for (auto& slot : slots) {
         auto result = co_await join_slot(slot.clone());
         if (result.is_err()) {
             auto f = state->fields.lock().unwrap();
-            if (f->close_error.is_none()) f->close_error = Some(rstd::move(result).unwrap_err());
+            f->close_errors.push(rstd::move(result).unwrap_err());
         }
     }
     auto f = state->fields.lock().unwrap();
-    if (f->close_error.is_some()) co_return Err(f->close_error->clone());
-    co_return Ok(empty {});
+    co_return collect_errors(rstd::exchange(f->close_errors, Vec<Error> {}));
 }
 } // namespace lifetchto::http
 namespace lifetchto::http
@@ -388,14 +387,14 @@ struct NativeAttempt {
         data->body->cancel(reason);
         data->native->changed.notify();
     }
-    auto release(ReleaseContext) -> coro<Result<empty>> {
+    auto wait_released() -> coro<empty> {
         if (data->input.is_some()) {
             data->input->body.cancel();
             auto closed = co_await data->input->body.close();
             {
                 auto f      = data->body->fields.lock().unwrap();
                 f->released = true;
-                if (closed.is_err()) f->cleanup_error = Some(closed.as_ref().unwrap_err().clone());
+                if (closed.is_err()) f->cleanup_errors.push(rstd::move(closed).unwrap_err());
             }
             data->body->notify();
             data->input = None();
@@ -404,7 +403,7 @@ struct NativeAttempt {
                 if (f->queue.is_some()) f->queue->release();
                 f->metadata_permit = None();
             }
-            co_return rstd::move(closed);
+            co_return empty {};
         }
         auto result = co_await wait_body_release(data->body.clone());
         {
@@ -412,7 +411,11 @@ struct NativeAttempt {
             if (f->queue.is_some()) f->queue->release();
             f->metadata_permit = None();
         }
-        co_return rstd::move(result);
+        co_return empty {};
+    }
+    auto release(ReleaseContext) -> coro<Result<empty>> {
+        co_await wait_released();
+        co_return take_body_cleanup(data->body);
     }
 };
 } // namespace lifetchto::http
@@ -443,7 +446,7 @@ auto NativeAttempt::run(TransferContext context, OutputSender<ResponseMessage> o
         empty {}, Arc<rstd::dyn<ManagedResource>>::make(AttemptLease { data->body.clone() }));
     if (lease.is_err()) {
         auto rejected = rstd::move(lease).unwrap_err();
-        (void)co_await release({});
+        co_await wait_released();
         rejected.input.request_close();
         (void)co_await rejected.input.close();
         co_return ProtocolCompletion { Err(rstd::move(rejected.error)), RemoteOutcome::Unknown };
@@ -454,7 +457,7 @@ auto NativeAttempt::run(TransferContext context, OutputSender<ResponseMessage> o
         auto permit = context.resources().try_reserve(ResourceAmount {
             .bytes = data->native->options.head_limit + data->native->options.upload_window });
         if (permit.is_err()) {
-            (void)co_await release({});
+            co_await wait_released();
             co_return ProtocolCompletion { Err(rstd::move(permit).unwrap_err()),
                                            RemoteOutcome::NotDispatched };
         }
@@ -464,7 +467,7 @@ auto NativeAttempt::run(TransferContext context, OutputSender<ResponseMessage> o
     auto queue =
         co_await ByteQueue::make(context.resources(), data->native->options.receive_window);
     if (queue.is_err()) {
-        (void)co_await release({});
+        co_await wait_released();
         co_return ProtocolCompletion { Err(rstd::move(queue).unwrap_err()),
                                        RemoteOutcome::NotDispatched };
     }
@@ -490,7 +493,7 @@ auto NativeAttempt::run(TransferContext context, OutputSender<ResponseMessage> o
         auto event = data->body->changed.listen();
         {
             auto f = data->body->fields.lock().unwrap();
-            if (f->consumed || f->canceled || f->error.is_some()) break;
+            if (f->consumed || f->canceled || f->failed) break;
         }
         co_await rstd::move(event);
     }
@@ -499,12 +502,18 @@ auto NativeAttempt::run(TransferContext context, OutputSender<ResponseMessage> o
     context.progress(Some(f->accepted_bytes),
                      f->dispatched ? None<u64>() : Some(u64()),
                      Some(f->received_bytes));
-    if (f->error.is_some())
-        co_return ProtocolCompletion { Err(f->error->clone()),
-                                       f->head.is_some() || f->finished
-                                           ? RemoteOutcome::Confirmed
-                                           : (f->dispatched ? RemoteOutcome::Unknown
-                                                            : RemoteOutcome::NotDispatched) };
+    if (result.is_err())
+        co_return ProtocolCompletion { Err(rstd::move(result).unwrap_err()),
+                                       f->dispatched ? RemoteOutcome::Unknown
+                                                     : RemoteOutcome::NotDispatched };
+    if (f->failed)
+        co_return ProtocolCompletion {
+            Err(Error::Closed()),
+            f->head.is_some() || f->finished
+                ? RemoteOutcome::Confirmed
+                : (f->dispatched ? RemoteOutcome::Unknown : RemoteOutcome::NotDispatched),
+            f->failure.is_some() ? Some(f->failure->clone()) : None<FailureReport>()
+        };
     if (f->canceled && ! f->consumed)
         co_return ProtocolCompletion { Err(Error::Canceled()),
                                        f->dispatched ? RemoteOutcome::Unknown
@@ -676,5 +685,12 @@ void NativeBackend::request_close() const {
 auto NativeBackend::close() const -> coro<Result<empty>> {
     request_close();
     return registration_->release();
+}
+auto NativeBackend::wait_closed() const -> coro<CleanupReport> {
+    request_close();
+    return registration_->wait_released();
+}
+auto NativeBackend::take_close_result() const -> Option<Result<empty>> {
+    return registration_->take_release_result();
 }
 } // namespace lifetchto::http

@@ -11,17 +11,23 @@ using rstd::bytes::Bytes;
 using rstd::sync::Arc;
 using rstd::time::Duration;
 using rstd::time::Instant;
+struct FailureReport {
+    String message;
+    String debug;
+    auto   clone() const -> FailureReport { return { message.clone(), debug.clone() }; }
+};
 class Error {
     RSTD_ENUM(Error,
               (InvalidOptions, (String message;)),
               (Unsupported, (String message;)),
               (Resolve, (rstd::net::LookupError cause;)),
               (Connect, (rstd::io::Error cause;)),
-              (Protocol, (String message; Option<Arc<rstd::dyn<rstd::error::Error>>> cause;)),
-              (Extension, (String name; Arc<rstd::dyn<rstd::error::Error>> cause;)),
+              (Protocol, (String message; Option<Box<rstd::dyn<rstd::error::Error>>> cause;)),
+              (Extension, (String name; Box<rstd::dyn<rstd::error::Error>> cause;)),
               (BodySource, (String message;)),
               (Redirect, (String message;)),
               (Contract, (String message;)),
+              (Multiple, (Vec<Error> errors;)),
               (Timeout),
               (Canceled),
               (Closed),
@@ -33,41 +39,15 @@ class Error {
               (AttemptsExhausted),
               (CacheMiss))
 private:
-    Option<Arc<rstd::dyn<rstd::error::Error>>> context_;
-    auto                                       clone_value() const -> Error {
-        if (is_InvalidOptions()) return InvalidOptions(as_InvalidOptions().message.clone());
-        if (is_Unsupported()) return Unsupported(as_Unsupported().message.clone());
-        if (is_Resolve()) return Resolve(as_Resolve().cause.clone());
-        if (is_Connect()) return Connect(as_Connect().cause);
-        if (is_Protocol())
-            return Protocol(as_Protocol().message.clone(), as_Protocol().cause.clone());
-        if (is_Extension())
-            return Extension(as_Extension().name.clone(), as_Extension().cause.clone());
-        if (is_BodySource()) return BodySource(as_BodySource().message.clone());
-        if (is_Redirect()) return Redirect(as_Redirect().message.clone());
-        if (is_Contract()) return Contract(as_Contract().message.clone());
-        if (is_Timeout()) return Timeout();
-        if (is_Canceled()) return Canceled();
-        if (is_Closed()) return Closed();
-        if (is_Capacity()) return Capacity();
-        if (is_Busy()) return Busy();
-        if (is_TooLarge()) return TooLarge();
-        if (is_OutputTaken()) return OutputTaken();
-        if (is_ReplayUnavailable()) return ReplayUnavailable();
-        if (is_AttemptsExhausted()) return AttemptsExhausted();
-        return CacheMiss();
-    }
+    friend struct CleanupState;
+    Option<u64>                                cleanup_id_;
+    Option<Box<rstd::dyn<rstd::error::Error>>> context_;
 
 public:
-    auto context() const -> const Option<Arc<rstd::dyn<rstd::error::Error>>>& { return context_; }
-    auto with_context(Arc<rstd::dyn<rstd::error::Error>> context) && -> Error {
+    auto context() const -> const Option<Box<rstd::dyn<rstd::error::Error>>>& { return context_; }
+    auto with_context(Box<rstd::dyn<rstd::error::Error>> context) && -> Error {
         context_ = Some(rstd::move(context));
         return rstd::move(*this);
-    }
-    auto clone() const -> Error {
-        auto copy     = clone_value();
-        copy.context_ = context_.clone();
-        return copy;
     }
 };
 template<class T>
@@ -80,6 +60,14 @@ struct Rejected {
 } // namespace lifetchto
 export namespace rstd
 {
+template<>
+struct Impl<fmt::Display, lifetchto::FailureReport> : ImplBase<lifetchto::FailureReport> {
+    auto fmt(fmt::Formatter& f) const -> bool { return f.write_str(this->self().message.as_str()); }
+};
+template<>
+struct Impl<fmt::Debug, lifetchto::FailureReport> : ImplBase<lifetchto::FailureReport> {
+    auto fmt(fmt::Formatter& f) const -> bool { return f.write_str(this->self().debug.as_str()); }
+};
 template<>
 struct Impl<fmt::Display, lifetchto::Error> : ImplBase<lifetchto::Error> {
     auto fmt(fmt::Formatter& f) const -> bool {
@@ -95,6 +83,15 @@ struct Impl<fmt::Display, lifetchto::Error> : ImplBase<lifetchto::Error> {
         if (e.is_BodySource()) return f.write_str(e.as_BodySource().message.as_str());
         if (e.is_Redirect()) return f.write_str(e.as_Redirect().message.as_str());
         if (e.is_Contract()) return f.write_str(e.as_Contract().message.as_str());
+        if (e.is_Multiple()) {
+            bool first = true;
+            for (const auto& error : e.as_Multiple().errors) {
+                if (! first && ! f.write_str("; "_str)) return false;
+                first = false;
+                if (! f.write_fmt(fmt::Arguments::make("{}", error))) return false;
+            }
+            return true;
+        }
         if (e.is_Timeout()) return f.write_str("transfer deadline expired"_str);
         if (e.is_Canceled()) return f.write_str("transfer canceled"_str);
         if (e.is_Closed()) return f.write_str("transfer owner closed"_str);
@@ -113,7 +110,6 @@ template<>
 struct Impl<error::Error, lifetchto::Error> : DefaultInImpl<error::Error, lifetchto::Error> {
     auto source() const noexcept -> Option<error::ErrorRef> {
         const auto& e = this->self();
-        if (e.context().is_some()) return Some(e.context()->deref());
         if (e.is_Extension()) return Some(e.as_Extension().cause.deref());
         if (e.is_Protocol() && e.as_Protocol().cause.is_some())
             return Some(e.as_Protocol().cause->deref());
@@ -123,3 +119,15 @@ struct Impl<error::Error, lifetchto::Error> : DefaultInImpl<error::Error, lifetc
     }
 };
 } // namespace rstd
+
+export namespace lifetchto
+{
+auto collect_errors(Vec<Error> errors) -> Result<empty> {
+    if (errors.is_empty()) return Ok(empty {});
+    if (errors.len() == usize(1)) return Err(errors.remove(usize()));
+    return Err(Error::Multiple(rstd::move(errors)));
+}
+auto report_failure(const Error& error) -> FailureReport {
+    return { rstd::format("{}", error), rstd::format("{:?}", error) };
+}
+} // namespace lifetchto

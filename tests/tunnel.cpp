@@ -65,7 +65,8 @@ struct Wire {
         state->gate->changed.notify();
         state->native.request_stop();
     }
-    auto close() const { return state->native.close(); }
+    auto wait_closed() const { return state->native.wait_closed(); }
+    auto take_close_result() const { return state->native.take_close_result(); }
 };
 struct Dial {
     Arc<rstd::sync::Mutex<Option<rstd::net::TcpConnect>>> connecting;
@@ -102,7 +103,8 @@ struct Impl<async::io::CompletionStream, tunnel_test::Wire> : ImplBase<tunnel_te
     auto flush() const { return this->self().flush(); }
     auto shutdown_write() const { return this->self().shutdown_write(); }
     void request_stop() const { this->self().request_stop(); }
-    auto close() const { return this->self().close(); }
+    auto wait_closed() const { return this->self().wait_closed(); }
+    auto take_close_result() const { return this->self().take_close_result(); }
 };
 template<>
 struct Impl<http::TcpDial, tunnel_test::Dial> : ImplBase<tunnel_test::Dial> {
@@ -175,6 +177,16 @@ auto tunnel_cause(rstd::error::ErrorRef error) -> Option<ref<T>> {
     for (unsigned depth = 0; depth < 12; ++depth) {
         auto typed = rstd::error::downcast_ref<T>(error);
         if (typed.is_some()) return typed;
+        auto transfer = rstd::error::downcast_ref<Error>(error);
+        if (transfer.is_some() && (*transfer)->context().is_some()) {
+            auto context = rstd::error::downcast_ref<T>((*transfer)->context()->deref());
+            if (context.is_some()) return context;
+        }
+        auto io = rstd::error::downcast_ref<rstd::io::Error>(error);
+        if (io.is_some() && (*io)->get_ref().is_some()) {
+            error = *(*io)->get_ref();
+            continue;
+        }
         auto next = error->source();
         if (next.is_none()) return None();
         error = *next;
@@ -192,11 +204,13 @@ auto tunnel_receive(rstd::async::io::Stream& stream, usize count) -> coro<Bytes>
 }
 auto tunnel_close_twice(rstd::async::io::Stream& stream) -> coro<empty> {
     for (unsigned count = 0; count < 2; ++count) {
-        auto closed = co_await rstd::async::timeout(stream.close().into_future(),
+        auto closed = co_await rstd::async::timeout(stream.wait_closed().into_future(),
                                                     Duration::from_secs(u64(2)));
         EXPECT_TRUE(closed.is_ok());
         if (closed.is_ok()) EXPECT_TRUE(closed->is_ok());
     }
+    auto result = stream.take_close_result();
+    if (result.is_some()) EXPECT_TRUE(result->is_ok());
     co_return empty {};
 }
 void tunnel_expect_broken_pipe(const rstd::io::Result<usize>& result) {
@@ -224,7 +238,7 @@ TEST(H2Tunnel, MultiplexesAuthorityAndKeepsCancelAndHalfCloseIndependent) {
         EXPECT_TRUE((co_await a.shutdown_write()).is_ok());
         EXPECT_TRUE((co_await a.recv()).unwrap().is_empty());
         EXPECT_TRUE((co_await a.close()).is_ok());
-        EXPECT_TRUE((co_await a.close()).is_ok());
+        EXPECT_TRUE((co_await a.wait_closed()).is_ok());
         auto canceled_read =
             co_await rstd::async::timeout(b.recv().into_future(), Duration::from_millis(u64(1)));
         EXPECT_TRUE(canceled_read.is_err());
@@ -317,7 +331,7 @@ TEST(H2Tunnel, CancelBeforeFinalHeadReleasesStreamWithoutClosingSharedPool) {
         EXPECT_EQ((co_await tunnel_receive(stream, usize(11))).as_slice(), "still works"_bytes);
         EXPECT_TRUE((co_await stream.close()).is_ok());
         EXPECT_TRUE((co_await client.close()).is_ok());
-        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await client.wait_closed()).is_ok());
         EXPECT_TRUE((co_await engine.close()).is_ok());
         co_return empty {};
     };
@@ -361,17 +375,13 @@ TEST(H2Tunnel, ReceiveOverwritesNonemptyBufferAndReusesStorage) {
     runtime.block_on(run());
 }
 
-TEST(HttpConnectDiagnostic, ContextClonePreservesErrorVariantsAndOwnedSource) {
+TEST(HttpConnectDiagnostic, ContextMovePreservesErrorVariants) {
     for (bool canceled : array<bool, 2> { false, true }) {
         auto cause   = canceled ? Error::Canceled() : Error::Timeout();
-        auto context = Arc<rstd::dyn<rstd::error::Error>>::make(
-            http::ConnectFailure { http::ConnectStage::ConnectHead,
-                                   u64(7),
-                                   u32(9),
-                                   Arc<rstd::dyn<rstd::error::Error>>::make(cause.clone()) });
+        auto context = Box<rstd::dyn<rstd::error::Error>>::make(
+            http::ConnectFailure { http::ConnectStage::ConnectHead, u64(7), u32(9) });
         auto annotated = rstd::move(cause).with_context(rstd::move(context));
-        auto cloned    = annotated.clone();
-        auto moved     = rstd::move(cloned);
+        auto moved     = rstd::move(annotated);
         EXPECT_TRUE(canceled ? moved.is_Canceled() : moved.is_Timeout());
         auto diagnostic = tunnel_cause<http::ConnectFailure>(
             rstd::dyn<rstd::error::Error>::from_ref(moved).deref());
@@ -380,12 +390,7 @@ TEST(HttpConnectDiagnostic, ContextClonePreservesErrorVariantsAndOwnedSource) {
         EXPECT_EQ((*diagnostic)->stage, http::ConnectStage::ConnectHead);
         EXPECT_EQ((*diagnostic)->session_id, u64(7));
         EXPECT_EQ((*diagnostic)->stream_id, u32(9));
-        auto original = rstd::error::downcast_ref<Error>((*diagnostic)->cause.deref());
-        EXPECT_TRUE(original.is_some());
-        if (original.is_some()) {
-            EXPECT_TRUE(canceled ? (*original)->is_Canceled() : (*original)->is_Timeout());
-            EXPECT_TRUE((*original)->context().is_none());
-        }
+        EXPECT_TRUE(rstd::dyn<rstd::error::Error>::from_ref(moved)->source().is_none());
     }
 }
 TEST(H2Tunnel, ConnectHeadTimeoutKeepsTimeoutVariantAndTypedPhase) {
@@ -504,8 +509,14 @@ TEST(H2Tunnel, PendingProgressDistinguishesTlsFromHttp2Settings) {
                 }
             }
             EXPECT_TRUE((co_await pending.close()).is_ok());
-            EXPECT_TRUE((co_await client.close()).is_ok());
-            EXPECT_TRUE((co_await engine.close()).is_ok());
+            auto closed = co_await client.close();
+            EXPECT_EQ(closed.is_err(), tls);
+            if (tls && closed.is_err()) {
+                auto error = rstd::move(closed).unwrap_err();
+                EXPECT_TRUE(error.is_Extension());
+                if (error.is_Extension()) EXPECT_EQ(error.as_Extension().name.as_str(), "tls"_str);
+            }
+            EXPECT_EQ((co_await engine.close()).total_errors, tls ? usize(1) : usize());
         }
         co_return empty {};
     };

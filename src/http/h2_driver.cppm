@@ -116,10 +116,8 @@ auto h2_driver(Arc<NativeState> client, Arc<Slot> slot, Connection connection, W
         {
             auto body      = initial.body->fields.lock().unwrap();
             body->released = true;
-            if (source.is_err())
-                body->cleanup_error = Some(rstd::move(source).unwrap_err());
-            else if (native.is_err())
-                body->cleanup_error = Some(rstd::move(native).unwrap_err());
+            if (source.is_err()) body->cleanup_errors.push(rstd::move(source).unwrap_err());
+            if (native.is_err()) body->cleanup_errors.push(rstd::move(native).unwrap_err());
         }
         {
             auto state     = slot->fields.lock().unwrap();
@@ -147,11 +145,18 @@ auto h2_driver(Arc<NativeState> client, Arc<Slot> slot, Connection connection, W
     H2Io             io;
     Vec<H2WriteItem> outgoing;
     Option<Error>    fatal;
-    bool             closing = false, transport_failed = false;
-    auto             settings_deadline = Instant::now() + client->options.connect_timeout;
-    auto             idle_deadline     = Instant::now() + client->options.idle_timeout;
-    Option<Instant>  shutdown_deadline;
-    auto             find = [&](u32 id) -> H2Stream* {
+    Vec<Error>       other_failures;
+    auto             fail = [&](Error error) {
+        if (fatal.is_none())
+            fatal = Some(rstd::move(error));
+        else
+            other_failures.push(rstd::move(error));
+    };
+    bool            closing = false, transport_failed = false;
+    auto            settings_deadline = Instant::now() + client->options.connect_timeout;
+    auto            idle_deadline     = Instant::now() + client->options.idle_timeout;
+    Option<Instant> shutdown_deadline;
+    auto            find = [&](u32 id) -> H2Stream* {
         for (const auto& stream : streams)
             if (stream->id == id) return stream.as_ptr().as_raw_ptr();
         return nullptr;
@@ -192,7 +197,7 @@ auto h2_driver(Arc<NativeState> client, Arc<Slot> slot, Connection connection, W
             s->http2_pending.clear();
         }
         if (! session.established() && now >= settings_deadline && ! closing) {
-            fatal   = Some(http2_error(lihttpto::h2::Error::Connection(u32(4))));
+            fail(http2_error(lihttpto::h2::Error::Connection(u32(4))));
             closing = true;
             session.shutdown(u32(4));
         }
@@ -200,7 +205,7 @@ auto h2_driver(Arc<NativeState> client, Arc<Slot> slot, Connection connection, W
             auto result = io.written.take().unwrap();
             progress    = true;
             if (result.is_err()) {
-                fatal            = Some(rstd::move(result).unwrap_err());
+                fail(rstd::move(result).unwrap_err());
                 transport_failed = true;
                 closing          = true;
             } else
@@ -210,11 +215,12 @@ auto h2_driver(Arc<NativeState> client, Arc<Slot> slot, Connection connection, W
             auto result = io.received.take().unwrap();
             progress    = true;
             if (result.is_err()) {
-                fatal            = Some(rstd::move(result).unwrap_err());
+                fail(rstd::move(result).unwrap_err());
                 transport_failed = true;
                 closing          = true;
             } else if (result->is_empty()) {
-                fatal            = Some(protocol_error("EOF in HTTP/2 connection"_Str));
+                if (! closing && ! streams.is_empty())
+                    fail(protocol_error("EOF in HTTP/2 connection"_Str));
                 transport_failed = true;
                 closing          = true;
             } else {
@@ -223,7 +229,7 @@ auto h2_driver(Arc<NativeState> client, Arc<Slot> slot, Connection connection, W
                     auto     error = rstd::move(received).unwrap_err();
                     unsigned code  = error.is_Compression() ? 9 : 1;
                     if (error.is_Connection()) code = error.as_Connection().code.to_primitive();
-                    fatal   = Some(http2_error(rstd::move(error)));
+                    fail(http2_error(rstd::move(error)));
                     closing = true;
                     session.shutdown(u32(code));
                 }
@@ -307,7 +313,7 @@ auto h2_driver(Arc<NativeState> client, Arc<Slot> slot, Connection connection, W
                 }
                 RSTD_CASE(Goaway, last_stream, code) {
                     if (code != u32()) {
-                        fatal   = Some(http2_error(lihttpto::h2::Error::Connection(u32(code))));
+                        fail(http2_error(lihttpto::h2::Error::Connection(u32(code))));
                         closing = true;
                     }
                     break;
@@ -333,7 +339,7 @@ auto h2_driver(Arc<NativeState> client, Arc<Slot> slot, Connection connection, W
             bool  canceled, consumed;
             {
                 auto b         = s.work.body->fields.lock().unwrap();
-                canceled       = b->canceled || b->error.is_some();
+                canceled       = b->canceled || b->failed;
                 consumed       = b->consumed;
                 usize buffered = client->options.receive_window - b->queue->available();
                 if (buffered < s.buffered) session.consume(s.id, s.buffered - buffered);
@@ -347,9 +353,10 @@ auto h2_driver(Arc<NativeState> client, Arc<Slot> slot, Connection connection, W
                     wake(*s.work.body->deadline);
             }
             if (closing || canceled) {
-                if (fatal.is_some())
-                    s.work.body->fail(fatal->clone());
-                else if (closing && ! consumed)
+                if (fatal.is_some()) {
+                    s.work.body->fail(Error::Closed());
+                    s.work.body->fields.lock().unwrap()->failure = Some(report_failure(*fatal));
+                } else if (closing && ! consumed)
                     s.work.body->cancel(StopReason::OwnerClosed);
                 if (! s.stopped) {
                     session.reset(s.id);
@@ -460,13 +467,10 @@ auto h2_driver(Arc<NativeState> client, Arc<Slot> slot, Connection connection, W
                 {
                     auto b           = s.work.body->fields.lock().unwrap();
                     b->upload_closed = true;
-                    if (s.closed->is_err() && b->cleanup_error.is_none())
-                        b->cleanup_error = Some(s.closed->as_ref().unwrap_err().clone());
-                }
-                if (s.closed->is_err()) {
-                    auto state = client->fields.lock().unwrap();
-                    if (state->close_error.is_none())
-                        state->close_error = Some(s.closed->as_ref().unwrap_err().clone());
+                    if (s.closed->is_err()) {
+                        b->cleanup_errors.push(rstd::move(*s.closed).unwrap_err());
+                        s.closed = Some(Result<empty>(Ok(empty {})));
+                    }
                 }
             }
         }
@@ -505,9 +509,9 @@ auto h2_driver(Arc<NativeState> client, Arc<Slot> slot, Connection connection, W
             bool  done = false;
             {
                 auto b = s.work.body->fields.lock().unwrap();
-                done   = s.closed.is_some() && s.local_done && s.remote_done &&
-                         (b->consumed || b->canceled || b->error.is_some()) &&
-                         io.completed >= s.last_serial && ! transport_failed;
+                done = s.closed.is_some() && s.local_done && s.remote_done &&
+                       (b->consumed || b->canceled || b->failed) && io.completed >= s.last_serial &&
+                       ! transport_failed;
                 if (done) b->released = true;
             }
             if (! done) {
@@ -591,15 +595,15 @@ auto h2_driver(Arc<NativeState> client, Arc<Slot> slot, Connection connection, W
         s->idle    = false;
     }
     auto closed = co_await connection.close();
-    if (closed.is_err()) {
+    if (closed.is_err() || fatal.is_some()) {
         auto state = client->fields.lock().unwrap();
-        if (state->close_error.is_none())
-            state->close_error = Some(closed.as_ref().unwrap_err().clone());
+        if (closed.is_err()) state->close_errors.push(rstd::move(closed).unwrap_err());
+        if (fatal.is_some()) state->close_errors.push(fatal.take().unwrap());
+        for (auto& error : other_failures) state->close_errors.push(rstd::move(error));
     }
     for (const auto& stream : streams) {
         auto b      = stream->work.body->fields.lock().unwrap();
         b->released = true;
-        if (closed.is_err()) b->cleanup_error = Some(closed.as_ref().unwrap_err().clone());
         stream->work.body->notify();
     }
     Vec<Work> pending;
@@ -617,7 +621,7 @@ auto h2_driver(Arc<NativeState> client, Arc<Slot> slot, Connection connection, W
         {
             auto b      = work.body->fields.lock().unwrap();
             b->released = true;
-            if (released.is_err()) b->cleanup_error = Some(rstd::move(released).unwrap_err());
+            if (released.is_err()) b->cleanup_errors.push(rstd::move(released).unwrap_err());
         }
         work.body->notify();
     }

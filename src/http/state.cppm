@@ -13,9 +13,11 @@ struct BodyFields {
     Option<ByteQueue>              queue;
     Option<lihttpto::Headers>      trailers;
     Option<Error>                  error;
-    Option<Error>                  cleanup_error;
+    Option<FailureReport>          failure;
+    Vec<Error>                     cleanup_errors;
+    bool                           cleanup_taken {};
     Option<ResourcePermit>         metadata_permit;
-    bool reusable {}, canceled {}, finished {}, consumed {}, reading {}, upload_done {},
+    bool reusable {}, canceled {}, failed {}, finished {}, consumed {}, reading {}, upload_done {},
         upload_closed {}, stop_upload {}, continued {}, released {}, dispatched {},
         upload_pulled {};
     u64 sent_bytes {}, accepted_bytes {}, received_bytes {};
@@ -26,7 +28,11 @@ struct BodyState {
     Option<Instant>                  deadline;
     Option<BodyTrafficObserver>      body_progress;
     rstd::sync::Mutex<Option<Event>> connection_changed { None<Event>() };
-    void                             notify() const {
+    void                             record_cleanup(Result<empty> result) const {
+        if (result.is_err())
+            fields.lock().unwrap()->cleanup_errors.push(rstd::move(result).unwrap_err());
+    }
+    void notify() const {
         changed.notify();
         auto event = connection_changed.lock().unwrap();
         if (event->is_some()) (*event)->notify();
@@ -53,9 +59,12 @@ struct BodyState {
         bool changed = false;
         {
             auto f = fields.lock().unwrap();
-            if (f->error.is_none()) {
-                changed = true;
-                if (f->queue.is_some()) f->queue->fail(e.clone());
+            if (! f->failed) {
+                changed    = true;
+                f->failed  = true;
+                f->failure = Some(report_failure(e));
+                // The queue wakes readers; the body owns the original failure.
+                if (f->queue.is_some()) f->queue->fail(Error::Closed());
                 f->error = Some(rstd::move(e));
             }
         }
@@ -65,10 +74,13 @@ struct BodyState {
         bool changed = false;
         {
             auto f      = fields.lock().unwrap();
-            changed     = ! f->canceled || (reason == StopReason::Deadline && f->error.is_none());
+            changed     = ! f->canceled || (reason == StopReason::Deadline && ! f->failed);
             f->canceled = true;
-            if (reason == StopReason::Deadline && f->error.is_none())
-                f->error = Some(Error::Timeout());
+            if (reason == StopReason::Deadline && ! f->failed) {
+                f->failed  = true;
+                f->error   = Some(Error::Timeout());
+                f->failure = Some(report_failure(*f->error));
+            }
             if (changed && f->queue.is_some()) f->queue->fail(stop_error(reason));
         }
         if (changed) notify();
@@ -115,7 +127,7 @@ struct NativeFields {
     Vec<NativeDuplexRegistration> duplex;
     usize                         waiters {}, handles { 1 };
     bool                          closed {};
-    Option<Error>                 close_error;
+    Vec<Error>                    close_errors;
 };
 auto active_duplex(NativeFields& fields) -> usize {
     usize count {};
@@ -147,7 +159,7 @@ auto body_stop(Arc<BodyState> body, bool writing = false) -> coro<Error> {
         auto event = body->changed.listen();
         {
             auto f = body->fields.lock().unwrap();
-            if (f->error.is_some()) co_return f->error->clone();
+            if (f->failed) co_return Error::Closed();
             if (f->canceled || (writing && f->stop_upload)) co_return Error::Canceled();
         }
         if (body->deadline.is_some()) {
@@ -169,7 +181,7 @@ auto guarded(Arc<BodyState> body, rstd::async::coro<Result<T>> task, bool writin
     -> coro<Result<T>> {
     {
         auto f = body->fields.lock().unwrap();
-        if (f->error.is_some()) co_return Err(f->error->clone());
+        if (f->failed) co_return Err(Error::Closed());
         if (f->canceled || (writing && f->stop_upload)) co_return Err(Error::Canceled());
     }
     if (body->deadline.is_some() && Instant::now() >= *body->deadline)

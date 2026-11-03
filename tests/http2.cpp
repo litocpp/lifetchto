@@ -183,8 +183,13 @@ TEST(H2Peer, BodyTrafficKeepsMultiplexedPayloadsSeparateAndSurvivesReset) {
             EXPECT_EQ(report.facts.body_progress.body_received_bytes,
                       Some(path == "/truncated"_str ? u64(3) : u64()));
         }
-        EXPECT_TRUE((co_await client.close()).is_ok());
-        EXPECT_TRUE((co_await engine.close()).is_ok());
+        EXPECT_EQ((co_await client.close()).total_errors, usize(1));
+        auto failures = client.take_close_errors();
+        EXPECT_EQ(failures.len(), usize(1));
+        EXPECT_TRUE(failures[usize()].is_Extension());
+        EXPECT_EQ(failures[usize()].as_Extension().name.as_str(), "tls"_str);
+        EXPECT_EQ((co_await engine.close()).total_errors, usize(1));
+        EXPECT_TRUE(engine.take_close_errors().is_empty());
         co_return empty {};
     };
     runtime.block_on(run());
@@ -356,7 +361,18 @@ TEST(H2Peer, ProtocolErrorAndRepeatedStreamsReleaseTheConnection) {
                  TestRequest::make(h2_url("/ok"_str, "LIFETCHTO_H2_BAD_PORT").as_str()).unwrap(),
                  rstd::move(options)))
                 .is_err());
-        EXPECT_TRUE((co_await bad.close()).is_ok());
+        auto failure = co_await bad.close();
+        EXPECT_TRUE(failure.is_err());
+        if (failure.is_err()) {
+            auto error = rstd::move(failure).unwrap_err();
+            EXPECT_TRUE(error.is_Extension());
+            if (error.is_Extension()) {
+                auto protocol = rstd::error::downcast_ref<lihttpto::h2::Error>(
+                    error.as_Extension().cause.deref());
+                EXPECT_TRUE(protocol.is_some());
+                if (protocol.is_some()) EXPECT_TRUE((*protocol)->is_Connection());
+            }
+        }
         EXPECT_TRUE(started.elapsed() < Duration::from_secs(u64(1)));
         co_return empty {};
     };
@@ -463,7 +479,7 @@ TEST(H2Peer, SourceReleaseFailureRemainsVisibleToClose) {
         auto response = co_await client.send(rstd::move(request), rstd::move(options));
         if (response.is_ok()) (void)co_await h2_text(*response);
         EXPECT_TRUE((co_await client.close()).is_err());
-        EXPECT_TRUE((co_await client.close()).is_err());
+        EXPECT_TRUE((co_await client.wait_closed()).is_err());
         EXPECT_EQ(*closes->lock().unwrap(), usize(1));
         co_return empty {};
     };
@@ -588,7 +604,8 @@ TEST(H2Peer, TruncatedTlsDoesNotCompleteResponse) {
         bool failed   = response.is_err();
         if (response.is_ok()) failed = (co_await h2_text(*response)).is_err();
         EXPECT_TRUE(failed);
-        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await client.close()).is_err());
+        EXPECT_TRUE((co_await client.wait_closed()).is_err());
         co_return empty {};
     };
     runtime.block_on(task());

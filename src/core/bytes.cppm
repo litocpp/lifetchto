@@ -53,7 +53,7 @@ struct UploadSourceState {
     Arc<rstd::dyn<ByteSource>>          source;
     rstd::async::Mutex<empty>           close_gate { empty {} };
     Option<coro<Result<empty>>::Future> release;
-    Option<Error>                       error;
+    CloseOutcome                        outcome;
     bool                                closed {};
     explicit UploadSourceState(Arc<rstd::dyn<ByteSource>> source): source(rstd::move(source)) {}
 };
@@ -98,6 +98,11 @@ public:
     }
     void request_close() const { cancel(); }
     auto close() const -> coro<Result<rstd::empty>>;
+    auto wait_closed() const -> coro<CleanupReport>;
+    auto take_close_result() const -> Option<Result<empty>> {
+        return source_.is_some() ? (*source_)->outcome.take_result()
+                                 : Some(Result<empty>(Ok(empty {})));
+    }
 };
 auto source_next(Arc<UploadSourceState> source, usize maximum) -> coro<Result<Option<Bytes>>> {
     co_return co_await source->source->next(maximum);
@@ -108,8 +113,8 @@ auto memory_next(Option<Bytes> bytes) -> coro<Result<Option<Bytes>>> {
 auto invalid_window() -> coro<Result<Option<Bytes>>> {
     co_return Err(Error::InvalidOptions(String::make("zero upload window"_str)));
 }
-auto source_close(Option<Arc<UploadSourceState>> source) -> coro<Result<rstd::empty>> {
-    if (source.is_none()) co_return Ok(empty {});
+auto source_wait_closed(Option<Arc<UploadSourceState>> source) -> coro<CleanupReport> {
+    if (source.is_none()) co_return CleanupReport {};
     auto state = source.take().unwrap();
     auto gate  = co_await state->close_gate.lock();
     if (! state->closed) {
@@ -118,10 +123,16 @@ auto source_close(Option<Arc<UploadSourceState>> source) -> coro<Result<rstd::em
         auto result    = co_await rstd::future::by_ref(*state->release);
         state->release = None();
         state->closed  = true;
-        if (result.is_err()) state->error = Some(rstd::move(result).unwrap_err());
+        state->outcome.complete(rstd::move(result));
     }
-    if (state->error.is_some()) co_return Err(state->error->clone());
-    co_return Ok(empty {});
+    co_return state->outcome.report();
+}
+auto source_close(Option<Arc<UploadSourceState>> source) -> coro<Result<empty>> {
+    if (source.is_none()) co_return Ok(empty {});
+    (void)co_await source_wait_closed(source.clone());
+    auto result = (*source)->outcome.take_result();
+    if (result.is_none()) co_return Err(Error::Contract("upload close result already taken"_Str));
+    co_return result.take().unwrap();
 }
 auto UploadBody::next(usize maximum) -> coro<Result<Option<Bytes>>> {
     if (maximum == usize()) return invalid_window();
@@ -134,6 +145,9 @@ auto UploadBody::next(usize maximum) -> coro<Result<Option<Bytes>>> {
 }
 auto UploadBody::close() const -> coro<Result<rstd::empty>> {
     return source_close(source_.clone());
+}
+auto UploadBody::wait_closed() const -> coro<CleanupReport> {
+    return source_wait_closed(source_.clone());
 }
 export struct UploadMetadata {
     Option<u64> length { Some(u64()) };
@@ -164,7 +178,7 @@ struct UploadPlanState {
     rstd::sync::Mutex<UploadPlanFields>       fields { UploadPlanFields {} };
     rstd::async::Mutex<empty>                 close_gate { empty {} };
     bool                                      closed {};
-    Option<Error>                             close_error;
+    CloseOutcome                              outcome;
     Option<coro<Result<rstd::empty>>::Future> close_task;
 };
 export class UploadPlan {
@@ -221,6 +235,10 @@ public:
         if (f->once.is_some()) f->once->cancel();
     }
     auto close() const -> coro<Result<rstd::empty>>;
+    auto wait_closed() const -> coro<CleanupReport>;
+    auto take_close_result() const -> Option<Result<rstd::empty>> {
+        return state_->outcome.take_result();
+    }
 };
 auto open_upload(Arc<UploadPlanState> state, TransferContext context) -> coro<Result<UploadBody>> {
     {
@@ -231,7 +249,9 @@ auto open_upload(Arc<UploadPlanState> state, TransferContext context) -> coro<Re
         auto body = co_await (*state->factory)->open(context.clone());
         if (body.is_err()) co_return Err(rstd::move(body).unwrap_err());
         if (body->length() != state->metadata.length) {
-            (void)co_await body->close();
+            auto closed = co_await body->close();
+            if (closed.is_err())
+                context.resources().record_cleanup_error(rstd::move(closed).unwrap_err());
             co_return Err(
                 Error::Contract(String::make("factory upload length differs from metadata"_str)));
         }
@@ -264,7 +284,7 @@ auto close_upload_sources(Option<UploadBody> once, Option<Arc<rstd::dyn<UploadFa
     if (error.is_some()) co_return Err(error.take().unwrap());
     co_return Ok(rstd::empty {});
 }
-auto close_upload(Arc<UploadPlanState> state) -> coro<Result<rstd::empty>> {
+auto wait_upload_closed(Arc<UploadPlanState> state) -> coro<CleanupReport> {
     auto gate = co_await state->close_gate.lock();
     if (! state->closed) {
         if (state->close_task.is_none()) {
@@ -279,14 +299,24 @@ auto close_upload(Arc<UploadPlanState> state) -> coro<Result<rstd::empty>> {
         auto result       = co_await rstd::future::by_ref(*state->close_task);
         state->close_task = None();
         state->closed     = true;
-        if (result.is_err()) state->close_error = Some(rstd::move(result).unwrap_err());
+        state->outcome.complete(rstd::move(result));
     }
-    if (state->close_error.is_some()) co_return Err(state->close_error->clone());
-    co_return Ok(rstd::empty {});
+    co_return state->outcome.report();
+}
+auto close_upload(Arc<UploadPlanState> state) -> coro<Result<rstd::empty>> {
+    (void)co_await wait_upload_closed(state.clone());
+    auto result = state->outcome.take_result();
+    if (result.is_none())
+        co_return Err(Error::Contract("upload plan close result already taken"_Str));
+    co_return result.take().unwrap();
 }
 auto UploadPlan::close() const -> coro<Result<rstd::empty>> {
     request_close();
     return close_upload(state_.clone());
+}
+auto UploadPlan::wait_closed() const -> coro<CleanupReport> {
+    request_close();
+    return wait_upload_closed(state_.clone());
 }
 } // namespace lifetchto
 export namespace rstd
@@ -313,7 +343,7 @@ namespace lifetchto
 struct ByteQueueFields {
     Vec<Bytes>             queue;
     usize                  buffered {};
-    bool                   finished {}, reading {};
+    bool                   finished {}, reading {}, failed {};
     Option<Error>          error;
     Option<ResourcePermit> permit;
 };
@@ -342,8 +372,7 @@ public:
         if (state_->cancellation.is_canceled())
             return Err(stop_error(*state_->cancellation.reason()));
         auto f = state_->fields.lock().unwrap();
-        if (f->error.is_some()) return Err(f->error->clone());
-        return Ok(! f->queue.is_empty() || f->finished);
+        return Ok(! f->queue.is_empty() || f->finished || f->failed);
     }
     auto wait_readable() const -> coro<Result<empty>>;
     auto wait_writable() const -> coro<Result<empty>>;
@@ -352,8 +381,7 @@ public:
             return Err(stop_error(*state_->cancellation.reason()));
         {
             auto f = state_->fields.lock().unwrap();
-            if (f->error.is_some()) return Err(f->error->clone());
-            if (f->finished) return Err(Error::Closed());
+            if (f->finished || f->failed) return Err(Error::Closed());
             if (bytes.len() > state_->capacity - f->buffered) return Err(Error::Capacity());
             f->buffered += bytes.len();
             f->queue.push(rstd::move(bytes));
@@ -375,7 +403,10 @@ public:
         {
             auto f = state_->fields.lock().unwrap();
             if (f->finished && f->buffered == usize()) return;
-            if (f->error.is_none()) f->error = Some(rstd::move(error));
+            if (! f->failed) {
+                f->failed = true;
+                f->error  = Some(rstd::move(error));
+            }
         }
         state_->changed.notify();
     }
@@ -414,9 +445,9 @@ auto wait_queue_state(Arc<ByteQueueState> state, bool writing) -> coro<Result<em
             co_return Err(stop_error(*state->cancellation.reason()));
         {
             auto f = state->fields.lock().unwrap();
-            if (f->error.is_some()) co_return Err(f->error->clone());
-            if (writing && f->finished) co_return Err(Error::Closed());
-            if (writing ? f->buffered < state->capacity : ! f->queue.is_empty() || f->finished)
+            if (writing && (f->finished || f->failed)) co_return Err(Error::Closed());
+            if (writing ? f->buffered < state->capacity
+                        : ! f->queue.is_empty() || f->finished || f->failed)
                 co_return Ok(empty {});
         }
         auto changed = co_await queue_changed(state.clone(), rstd::move(event));
@@ -445,14 +476,18 @@ struct QueueReadGuard {
         {
             auto f     = state->fields.lock().unwrap();
             f->reading = false;
-            if (! complete && f->error.is_none()) f->error = Some(Error::Canceled());
+            if (! complete && ! f->failed) {
+                f->failed = true;
+                f->error  = Some(Error::Canceled());
+            }
         }
         state->changed.notify();
     }
 };
 auto take_queued(const Arc<ByteQueueState>& state, usize maximum) -> Result<Option<Option<Bytes>>> {
     auto f = state->fields.lock().unwrap();
-    if (f->error.is_some()) return Err(f->error->clone());
+    if (f->error.is_some()) return Err(f->error.take().unwrap());
+    if (f->failed) return Err(Error::Closed());
     if (state->deadline.is_some() && Instant::now() >= *state->deadline)
         return Err(Error::Timeout());
     if (state->cancellation.is_canceled()) return Err(stop_error(*state->cancellation.reason()));

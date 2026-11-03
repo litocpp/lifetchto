@@ -59,6 +59,15 @@ auto UpgradeConnection::read_from(Arc<UpgradeConnectionState> state) -> coro<Res
 auto UpgradeConnection::response() const -> const lihttpto::ResponseHead& {
     return state_->response;
 }
+auto UpgradeConnection::take_error() const -> Option<Error> {
+    return state_->wire.take_error();
+}
+auto UpgradeConnection::take_write_error() const -> Option<Error> {
+    return state_->wire.take_write_error();
+}
+auto UpgradeConnection::take_cleanup_errors() const -> Vec<Error> {
+    return state_->wire.take_cleanup_errors();
+}
 auto UpgradeConnection::read() const -> coro<Result<Bytes>> {
     return read_from(state_.clone());
 }

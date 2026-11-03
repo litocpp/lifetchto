@@ -22,7 +22,7 @@ struct Reply {
     u16                 status { 200 };
     lihttpto::Headers   headers;
     Bytes               data { Bytes::copy_from_slice("payload"_str.as_bytes()) };
-    bool                connect_error {}, source_error {};
+    bool                connect_error {}, source_error {}, completion_error {};
     lf::RemoteOutcome   remote { lf::RemoteOutcome::Confirmed };
     h::CacheObservation cache;
 };
@@ -41,6 +41,24 @@ struct Scenario {
 using Script = Arc<rstd::sync::Mutex<Scenario>>;
 struct Cursor {
     bool sent {}, canceled {}, closed {};
+};
+struct BodyReadCause {
+    int* drops;
+    explicit BodyReadCause(int& drops): drops(&drops) {}
+    BodyReadCause(const BodyReadCause&) = delete;
+    BodyReadCause(BodyReadCause&& other) noexcept: drops(rstd::exchange(other.drops, nullptr)) {}
+    ~BodyReadCause() {
+        if (drops) ++*drops;
+    }
+};
+struct ReadFailureSource {
+    int* drops;
+    int* reads;
+    bool fail_close {};
+    auto next() const -> coro<lf::Result<Option<Bytes>>>;
+    auto trailers() const -> lf::Result<Option<lihttpto::Headers>> { return Ok(None()); }
+    void cancel() const {}
+    auto close() const -> coro<lf::Result<empty>>;
 };
 struct Source {
     Arc<rstd::sync::Mutex<Cursor>> cursor { Arc<rstd::sync::Mutex<Cursor>>::make(Cursor {}) };
@@ -170,6 +188,21 @@ struct ForwardStore {
 namespace rstd
 {
 template<>
+struct Impl<fmt::Display, BodyReadCause> : ImplBase<BodyReadCause> {
+    auto fmt(fmt::Formatter& f) const -> bool { return f.write_str("owned body read failure"_str); }
+};
+template<>
+struct Impl<fmt::Debug, BodyReadCause> : Impl<fmt::Display, BodyReadCause> {};
+template<>
+struct Impl<error::Error, BodyReadCause> : DefaultInImpl<error::Error, BodyReadCause> {};
+template<>
+struct Impl<h::ResponseSource, ReadFailureSource> : ImplBase<ReadFailureSource> {
+    auto next() const { return this->self().next(); }
+    auto trailers() const { return this->self().trailers(); }
+    void cancel() const { this->self().cancel(); }
+    auto close() const { return this->self().close(); }
+};
+template<>
 struct Impl<h::ResponseSource, Source> : ImplBase<Source> {
     auto next() const { return this->self().next(); }
     auto trailers() const { return this->self().trailers(); }
@@ -246,6 +279,21 @@ struct Impl<h::CacheStore, ForwardStore> : ImplBase<ForwardStore> {
 } // namespace rstd
 namespace
 {
+auto ReadFailureSource::next() const -> coro<lf::Result<Option<Bytes>>> {
+    ++*reads;
+    co_await rstd::async::sleep(Duration::from_millis(u64(10)));
+    co_return Err(lf::Error::Connect(rstd::io::Error::with_source(
+        rstd::io::ErrorKind { rstd::io::ErrorKind::BrokenPipe },
+        Box<rstd::dyn<rstd::error::Error>>::make(BodyReadCause(*drops)))));
+}
+auto ReadFailureSource::close() const -> coro<lf::Result<empty>> {
+    if (! fail_close) co_return Ok(empty {});
+    ++*reads;
+    co_await rstd::async::sleep(Duration::from_millis(u64(10)));
+    co_return Err(lf::Error::Connect(rstd::io::Error::with_source(
+        rstd::io::ErrorKind { rstd::io::ErrorKind::BrokenPipe },
+        Box<rstd::dyn<rstd::error::Error>>::make(BodyReadCause(*drops)))));
+}
 auto Exchange::run(lf::TransferContext context, lf::OutputSender<h::ResponseMessage> output)
     -> coro<lf::ProtocolCompletion> {
     auto counted = context.begin_attempt();
@@ -292,7 +340,11 @@ auto Exchange::run(lf::TransferContext context, lf::OutputSender<h::ResponseMess
           reply.cache });
     if (sent.is_err()) control.cancel();
     auto done = co_await control.wait();
-    co_return lf::ProtocolCompletion { rstd::move(done), reply.remote };
+    if (reply.completion_error)
+        co_return lf::ProtocolCompletion {
+            Err(lf::Error::Protocol("attempt failed after response"_Str, None())), reply.remote
+        };
+    co_return lf::ProtocolCompletion { rstd::move(done), reply.remote, control.failure() };
 }
 auto finish(lf::Transfer<h::ResponseMessage>& transfer) -> coro<lf::Result<Bytes>> {
     auto response = co_await transfer.output();
@@ -305,8 +357,7 @@ auto finish(lf::Transfer<h::ResponseMessage>& transfer) -> coro<lf::Result<Bytes
         bytes.extend_from_slice((**part).as_slice());
     }
     auto report = co_await transfer.control().wait();
-    if (report->logical.result.is_err())
-        co_return Err(report->logical.result.as_ref().unwrap_err().clone());
+    if (report->logical.result.is_err()) co_return Err(transfer.take_error().unwrap());
     co_return Ok(Bytes::copy_from_slice(bytes.as_slice()));
 }
 auto binding(Script script) -> h::BackendBinding {
@@ -329,6 +380,98 @@ auto redirection(u16 status, ref<str> target) -> Reply {
     return reply;
 }
 } // namespace
+TEST(HttpPolicy, BodyReadOwnsFailureWhileObserversKeepOnlyDiagnostics) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        for (bool cancel : array<bool, 2> { false, true }) {
+            int  drops {}, reads {};
+            auto body = h::ResponseBody::from_source(
+                Arc<rstd::dyn<h::ResponseSource>>::make(ReadFailureSource { &drops, &reads }));
+            auto observer = body.completion();
+            auto waiting  = body.next().into_future();
+            if (cancel) {
+                auto interrupted =
+                    co_await rstd::async::select(rstd::future::by_ref(waiting),
+                                                 rstd::async::sleep(Duration::from_millis(u64(1))));
+                EXPECT_TRUE(interrupted.is_right());
+                observer.cancel(lf::StopReason::Deadline);
+            }
+            {
+                auto result = co_await rstd::move(waiting);
+                EXPECT_TRUE(result.as_ref().unwrap_err().is_Connect());
+                auto& native = result.as_ref().unwrap_err().as_Connect().cause;
+                EXPECT_EQ(native.kind(), rstd::io::ErrorKind { rstd::io::ErrorKind::BrokenPipe });
+                EXPECT_TRUE(
+                    rstd::error::downcast_ref<BodyReadCause>(native.get_ref().unwrap()).is_some());
+                EXPECT_EQ(drops, 0);
+            }
+            EXPECT_EQ(drops, 1);
+            for (int i = 0; i < 2; ++i) {
+                EXPECT_TRUE((co_await observer.wait()).unwrap_err().is_Closed());
+                EXPECT_TRUE((co_await body.next()).unwrap_err().is_Closed());
+                EXPECT_TRUE(body.trailers().unwrap_err().is_Closed());
+                EXPECT_EQ(observer.failure()->message.as_str(), "owned body read failure"_str);
+            }
+            EXPECT_EQ(reads, 1);
+            EXPECT_TRUE((co_await body.close()).is_ok());
+            EXPECT_EQ(drops, 1);
+        }
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
+
+TEST(HttpPolicy, BodyCleanupHasOneOwnerAndSurvivesCanceledWait) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        for (bool claim : array<bool, 2> { false, true }) {
+            int  drops {}, closes {};
+            auto body     = h::ResponseBody::from_source(Arc<rstd::dyn<h::ResponseSource>>::make(
+                ReadFailureSource { &drops, &closes, true }));
+            auto observer = body.completion();
+            Option<h::BodyCleanup> owner;
+            if (claim) owner = Some(body.take_cleanup().unwrap());
+            auto canceled = co_await rstd::async::timeout(observer.close().into_future(),
+                                                          Duration::from_millis(u64(1)));
+            EXPECT_TRUE(canceled.is_err());
+            EXPECT_TRUE(body.take_close_result().is_none());
+            EXPECT_EQ((co_await observer.close()).total_errors, usize(1));
+            EXPECT_EQ((co_await body.close()).total_errors, usize(1));
+            EXPECT_EQ(closes, 1);
+            {
+                auto error = claim ? co_await owner->close() : body.take_close_result().unwrap();
+                EXPECT_TRUE(error.as_ref().unwrap_err().is_Connect());
+                EXPECT_TRUE(rstd::error::downcast_ref<BodyReadCause>(
+                                error.as_ref().unwrap_err().as_Connect().cause.get_ref().unwrap())
+                                .is_some());
+                EXPECT_EQ(drops, 0);
+            }
+            EXPECT_EQ(drops, 1);
+            EXPECT_TRUE(body.take_close_result().is_none());
+            if (claim) EXPECT_TRUE((co_await owner->close()).unwrap_err().is_Contract());
+            EXPECT_EQ((co_await observer.close()).total_errors, usize(1));
+        }
+        for (bool claim : array<bool, 2> { false, true }) {
+            int                    drops {}, closes {};
+            Option<h::BodyControl> observer;
+            {
+                auto body = h::ResponseBody::from_source(Arc<rstd::dyn<h::ResponseSource>>::make(
+                    ReadFailureSource { &drops, &closes, true }));
+                observer  = Some(body.completion());
+                Option<h::BodyCleanup> owner;
+                if (claim) owner = Some(body.take_cleanup().unwrap());
+                EXPECT_TRUE((co_await observer->close()).is_err());
+                EXPECT_EQ(drops, 0);
+            }
+            EXPECT_EQ(drops, 1);
+            EXPECT_EQ((co_await observer->close()).total_errors, usize(1));
+            EXPECT_EQ(closes, 1);
+        }
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
+
 TEST(HttpPolicy, RetryReusesPreparationAndRoutingAndReportsEachAttempt) {
     auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
     auto run     = [&]() -> coro<empty> {
@@ -366,6 +509,67 @@ TEST(HttpPolicy, RetryReusesPreparationAndRoutingAndReportsEachAttempt) {
     };
     runtime.block_on(run());
 }
+TEST(HttpPolicy, AttemptReportsKeepDiagnosticsWithoutReplacingBodyErrors) {
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        for (bool caching : array<bool, 2> { false, true }) {
+            for (bool body_failure : array<bool, 2> { false, true }) {
+                auto  engine = lf::Engine::make(runtime.handle()).unwrap();
+                auto  script = Script::make(Scenario {});
+                Reply reply;
+                reply.completion_error = true;
+                reply.source_error     = body_failure;
+                reply.headers.add("Cache-Control"_str, "max-age=60"_str).unwrap();
+                script->lock().unwrap()->replies.push(rstd::move(reply));
+                h::ClientConfig config;
+                auto            cache = h::MemoryCache::make(engine.resources()).unwrap();
+                if (caching) {
+                    config.policy.cache = h::CacheMode::Default;
+                    config.cache =
+                        Some(h::CacheBinding::Store(h::StoreBinding::Shared(cache.store())));
+                }
+                auto client =
+                    h::Client::make(engine.handle(), binding(script.clone()), rstd::move(config))
+                        .unwrap();
+                h::ExecutionObserver observer;
+                h::ExecuteOptions    options;
+                options.report = Some(observer.clone());
+                auto transfer  = client.execute(request(), rstd::move(options)).unwrap();
+                auto response  = (co_await transfer.output()).unwrap();
+                EXPECT_TRUE((co_await response.body.next()).unwrap().is_some());
+                auto end = co_await response.body.next();
+                if (body_failure)
+                    EXPECT_TRUE(end.as_ref().unwrap_err().is_BodySource());
+                else if (caching)
+                    EXPECT_TRUE(end.as_ref().unwrap_err().is_Closed());
+                else
+                    EXPECT_TRUE(end.unwrap().is_none());
+                auto report   = (co_await observer.wait()).unwrap();
+                auto original = transfer.take_error();
+                EXPECT_TRUE(original.is_some());
+                EXPECT_EQ(original->is_Closed(), body_failure);
+                EXPECT_EQ(original->is_Protocol(), ! body_failure);
+                EXPECT_TRUE(transfer.take_error().is_none());
+                auto expected =
+                    body_failure ? "truncated source"_str : "attempt failed after response"_str;
+                EXPECT_EQ(report.transfer->logical.result.as_ref().unwrap_err().message.as_str(),
+                          expected);
+                EXPECT_EQ(report.facts.history.len(), usize(1));
+                EXPECT_EQ(report.facts.history[usize()].error->message.as_str(),
+                          "attempt failed after response"_str);
+                original      = None();
+                auto repeated = (co_await observer.wait()).unwrap();
+                EXPECT_EQ(repeated.transfer->logical.result.as_ref().unwrap_err().message.as_str(),
+                          expected);
+                EXPECT_TRUE((co_await client.close()).is_ok());
+                EXPECT_TRUE((co_await engine.close()).is_ok());
+            }
+        }
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
+
 TEST(HttpPolicy, RedirectsPreserveOrRewriteUploadAndFactoryReopens) {
     auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
     auto run     = [&]() -> coro<empty> {

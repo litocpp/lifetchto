@@ -110,17 +110,17 @@ struct Routing {
     auto clone() const -> Routing { return { route.clone(), shared_provider.clone() }; }
 };
 struct AttemptReport {
-    String        target;
-    Option<u16>   status;
-    RemoteOutcome remote;
-    Progress      progress;
-    Option<Error> error;
-    auto          clone() const -> AttemptReport {
+    String                target;
+    Option<u16>           status;
+    RemoteOutcome         remote;
+    Progress              progress;
+    Option<FailureReport> error;
+    auto                  clone() const -> AttemptReport {
         return { target.clone(),
                  status,
                  remote,
                  progress,
-                 error.is_some() ? Some(error->clone()) : None<Error>() };
+                 error.is_some() ? Some(error->clone()) : None<FailureReport>() };
     }
 };
 struct ExecutionFacts {
@@ -250,6 +250,7 @@ public:
     auto upgrade(UpgradeRequest request, UpgradeOptions options = {}) const
         -> rstd::Result<PendingUpgrade, Rejected<UpgradeRequest>>;
     void request_close() const;
-    auto close() const -> coro<CloseReport>;
+    auto close() const -> coro<CleanupReport>;
+    auto take_close_errors() -> Vec<Error>;
 };
 } // namespace lifetchto::http

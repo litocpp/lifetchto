@@ -29,7 +29,7 @@ auto upload(Connection& connection, Work& work, const TransportOptions& options)
             auto event = work.body->changed.listen();
             {
                 auto f = work.body->fields.lock().unwrap();
-                if (f->canceled || f->error.is_some()) co_return Err(Error::Canceled());
+                if (f->canceled || f->failed) co_return Err(Error::Canceled());
                 if (f->continued || f->stop_upload) break;
             }
             auto result = co_await rstd::async::select(rstd::move(event),
@@ -106,7 +106,10 @@ auto send_request(Connection& connection, Work& work, const TransportOptions& op
         auto f = work.body->fields.lock().unwrap();
         early  = f->stop_upload;
     }
-    if (result.is_err() && ! early) work.body->fail(result.unwrap_err().clone());
+    if (result.is_err() && ! early) {
+        work.body->fail(rstd::move(result).unwrap_err());
+        result = Err(Error::Closed());
+    }
     if (result.is_err()) work.request.body().cancel();
     auto closed = co_await work.request.body().close();
     {
@@ -114,12 +117,12 @@ auto send_request(Connection& connection, Work& work, const TransportOptions& op
         f->upload_closed = true;
     }
     if (closed.is_err()) {
-        auto f           = work.body->fields.lock().unwrap();
-        f->cleanup_error = Some(closed.unwrap_err().clone());
+        auto f = work.body->fields.lock().unwrap();
+        f->cleanup_errors.push(rstd::move(closed).unwrap_err());
     }
     if (closed.is_err() && result.is_ok()) {
-        work.body->fail(closed.unwrap_err().clone());
-        co_return Err(rstd::move(closed).unwrap_err());
+        work.body->fail(Error::Closed());
+        co_return Err(Error::Closed());
     }
     co_return rstd::move(result);
 }
@@ -261,7 +264,10 @@ auto receive_response(Connection&                                      connectio
                       Option<rstd::async::coro<Result<Bytes>>::Future> initial)
     -> coro<Result<bool>> {
     auto result = co_await read_response(connection, work, options, rstd::move(initial));
-    if (result.is_err()) work.body->fail(result.unwrap_err().clone());
+    if (result.is_err()) {
+        work.body->fail(rstd::move(result).unwrap_err());
+        co_return Err(Error::Closed());
+    }
     co_return rstd::move(result);
 }
 template<class F>
@@ -285,11 +291,6 @@ auto driver(Arc<NativeState> client, Arc<Slot> slot) -> coro<empty> {
         work.body->fail(rstd::move(connected).unwrap_err());
         work.request.body().cancel();
         auto source_closed = co_await work.request.body().close();
-        if (source_closed.is_err()) {
-            auto f = client->fields.lock().unwrap();
-            if (f->close_error.is_none())
-                f->close_error = Some(rstd::move(source_closed).unwrap_err());
-        }
         {
             auto f    = slot->fields.lock().unwrap();
             f->done   = true;
@@ -299,7 +300,7 @@ auto driver(Arc<NativeState> client, Arc<Slot> slot) -> coro<empty> {
             auto f      = work.body->fields.lock().unwrap();
             f->released = true;
             if (source_closed.is_err())
-                f->cleanup_error = Some(source_closed.as_ref().unwrap_err().clone());
+                f->cleanup_errors.push(rstd::move(source_closed).unwrap_err());
         }
         work.body->notify();
         slot->permit = None();
@@ -327,7 +328,7 @@ auto driver(Arc<NativeState> client, Arc<Slot> slot) -> coro<empty> {
             auto event = work.body->changed.listen();
             {
                 auto f = work.body->fields.lock().unwrap();
-                if (f->canceled || f->error.is_some() || f->stop_upload) {
+                if (f->canceled || f->failed || f->stop_upload) {
                     reusable = false;
                     break;
                 }
@@ -408,12 +409,20 @@ auto driver(Arc<NativeState> client, Arc<Slot> slot) -> coro<empty> {
         s->idle    = false;
         s->closing = true;
     }
-    auto released = co_await connection.close();
+    auto          released = co_await connection.close();
+    Option<Error> idle_cleanup;
     {
         auto f = work.body->fields.lock().unwrap();
-        if (released.is_err()) f->cleanup_error = Some(released.as_ref().unwrap_err().clone());
+        if (released.is_err()) {
+            if (f->released)
+                idle_cleanup = Some(rstd::move(released).unwrap_err());
+            else
+                f->cleanup_errors.push(rstd::move(released).unwrap_err());
+        }
         f->released = true;
     }
+    if (idle_cleanup.is_some())
+        client->fields.lock().unwrap()->close_errors.push(idle_cleanup.take().unwrap());
     work.body->notify();
     Option<Work> pending;
     {
@@ -429,7 +438,7 @@ auto driver(Arc<NativeState> client, Arc<Slot> slot) -> coro<empty> {
         {
             auto f      = pending->body->fields.lock().unwrap();
             f->released = true;
-            if (closed.is_err()) f->cleanup_error = Some(rstd::move(closed).unwrap_err());
+            if (closed.is_err()) f->cleanup_errors.push(rstd::move(closed).unwrap_err());
         }
         pending->body->notify();
     }

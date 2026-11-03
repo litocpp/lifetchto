@@ -88,7 +88,10 @@ inline auto test_response(Arc<lifetchto::Engine> engine,lifetchto::Transfer<life
 }
 inline auto test_rejected(lifetchto::Rejected<lifetchto::http::ExecutionRequest> rejected)->coro<lifetchto::Result<TestResponse>>{(void)co_await rejected.input.body.close();co_return Err(rstd::move(rejected.error));}
 inline auto test_close(Arc<TestClientState> state)->coro<lifetchto::Result<empty>>{
-    auto client=co_await state->client.close();auto engine=co_await state->engine->close();if(client.is_err())co_return Err(client.errors[usize()].clone());if(engine.is_err())co_return Err(engine.errors[usize()].clone());co_return Ok(empty{});
+    (void)co_await state->client.close();(void)co_await state->engine->close();auto client=state->client.take_close_errors();auto engine=state->engine->take_close_errors();for(auto& error:engine)client.push(rstd::move(error));co_return lifetchto::collect_errors(rstd::move(client));
+}
+inline auto test_wait_closed(Arc<TestClientState> state)->coro<lifetchto::CleanupReport>{
+    (void)co_await state->client.close();co_return co_await state->engine->close();
 }
 class TestClient{
     Arc<TestClientState> state_;
@@ -109,5 +112,6 @@ public:
     auto exchange(TestRequest request,ExchangeOptions options={})const->coro<lifetchto::Result<TestResponse>>{return send(rstd::move(request),rstd::move(options));}
     void request_close()const{state_->client.request_close();}
     auto close()const->coro<lifetchto::Result<empty>>{request_close();return test_close(state_.clone());}
+    auto wait_closed()const->coro<lifetchto::CleanupReport>{request_close();return test_wait_closed(state_.clone());}
 };
 }

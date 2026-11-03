@@ -18,12 +18,28 @@ auto tls_result(rstd::async::coro<licrypto::CryptoResult<T>> operation) -> coro<
     if (result.is_err()) co_return Err(tls_error(rstd::move(result).unwrap_err()));
     co_return Ok(rstd::move(result).unwrap());
 }
+auto close_tls(licrypto::tls::Stream stream, licrypto::tls::CloseMode mode) -> coro<Result<empty>> {
+    Vec<Error> errors;
+    auto       result = co_await stream.close(mode);
+    if (result.is_err()) errors.push(tls_error(rstd::move(result).unwrap_err()));
+    for (;;) {
+        auto error = stream.take_error();
+        if (error.is_none()) break;
+        errors.push(tls_error(error.take().unwrap()));
+    }
+    auto cleanup = stream.take_close_error();
+    if (cleanup.is_some()) errors.push(tls_error(cleanup.take().unwrap()));
+    co_return collect_errors(rstd::move(errors));
+}
 #endif
 enum class ConnectionClose
 {
     Protocol,
     SendOnly
 };
+void record_io_cleanup(const Arc<BodyState>& body, rstd::io::Result<empty> result) {
+    if (result.is_err()) body->record_cleanup(Err(Error::Connect(rstd::move(result).unwrap_err())));
+}
 struct Connection {
     bool                            http2 {};
     Bytes                           pending;
@@ -107,10 +123,10 @@ struct Connection {
     auto close(ConnectionClose behavior = ConnectionClose::Protocol) -> coro<Result<empty>> {
 #if LITO_FEAT_TLS
         if (tls.is_some())
-            return tls_result(rstd::move(tls.take().unwrap())
-                                  .close(http2 || behavior == ConnectionClose::SendOnly
-                                             ? licrypto::tls::CloseMode::SendOnly
-                                             : licrypto::tls::CloseMode::WaitPeer));
+            return close_tls(tls.take().unwrap(),
+                             http2 || behavior == ConnectionClose::SendOnly
+                                 ? licrypto::tls::CloseMode::SendOnly
+                                 : licrypto::tls::CloseMode::WaitPeer);
 #endif
 #if RSTD_OS_UNIX
         if (unix.is_some()) return io_result(rstd::move(unix.take().unwrap()).close());
@@ -202,7 +218,7 @@ auto proxy_tunnel(Connection&             connection,
         failure.body = Bytes::copy_from_slice(collected.as_slice());
         co_return Err(
             Error::Protocol("proxy CONNECT rejected"_Str,
-                            Some(Arc<rstd::dyn<rstd::error::Error>>::make(rstd::move(failure)))));
+                            Some(Box<rstd::dyn<rstd::error::Error>>::make(rstd::move(failure)))));
     }
 }
 auto connect_deadline(const TransportOptions& options, const BodyState& body) -> Instant {
@@ -214,12 +230,8 @@ auto close_dial(Arc<rstd::dyn<TcpDial>> dial, Arc<NativeState> client, Arc<BodyS
     -> coro<empty> {
     auto result = co_await dial->close();
     if (result.is_err()) {
-        {
-            auto f = client->fields.lock().unwrap();
-            if (f->close_error.is_none()) f->close_error = Some(result.unwrap_err().clone());
-        }
         auto f = body->fields.lock().unwrap();
-        if (f->cleanup_error.is_none()) f->cleanup_error = Some(rstd::move(result).unwrap_err());
+        f->cleanup_errors.push(rstd::move(result).unwrap_err());
     }
     co_return empty {};
 }
@@ -257,12 +269,12 @@ auto connect_tcp(rstd::net::SocketAddr                address,
         rstd::future::by_ref(*finish), connect_stop(body.clone(), deadline).into_future());
     finish = None();
     if (connected.is_right()) {
-        (void)co_await rstd::move(connecting).close();
+        record_io_cleanup(body, co_await rstd::move(connecting).close());
         co_return Err(rstd::move(connected).unwrap_right());
     }
     auto result = rstd::move(connected).unwrap_left();
     if (result.is_err()) {
-        (void)co_await rstd::move(connecting).close();
+        record_io_cleanup(body, co_await rstd::move(connecting).close());
         co_return Err(Error::Connect(result.unwrap_err()));
     }
     auto stream = rstd::move(connecting).into_stream();
@@ -271,7 +283,7 @@ auto connect_tcp(rstd::net::SocketAddr                address,
     if (configured.is_ok() && client->options.tcp.keepalive.is_some())
         configured = stream->set_keepalive(*client->options.tcp.keepalive);
     if (configured.is_err()) {
-        (void)co_await rstd::move(*stream).close();
+        record_io_cleanup(body, co_await rstd::move(*stream).close());
         co_return Err(Error::Connect(configured.unwrap_err()));
     }
     auto adapted = rstd::net::as_stream(rstd::move(*stream));
@@ -302,12 +314,12 @@ auto connect_native(Arc<NativeState>     client,
             rstd::future::by_ref(*finish), connect_stop(body.clone(), deadline).into_future());
         if (result.is_right()) {
             finish = None();
-            (void)co_await rstd::move(connecting).close();
+            record_io_cleanup(body, co_await rstd::move(connecting).close());
             co_return Err(rstd::move(result).unwrap_right());
         }
         auto value = rstd::move(result).unwrap_left();
         if (value.is_err()) {
-            (void)co_await rstd::move(connecting).close();
+            record_io_cleanup(body, co_await rstd::move(connecting).close());
             co_return Err(Error::Connect(value.unwrap_err()));
         }
         connection.unix = Some(rstd::move(connecting).into_stream().unwrap());
@@ -393,19 +405,19 @@ auto connect_native(Arc<NativeState>     client,
         auto tunnel =
             co_await proxy_tunnel(connection, url, body.clone(), deadline, client->options);
         if (tunnel.is_err()) {
-            (void)co_await connection.close();
+            body->record_cleanup(co_await connection.close());
             co_return Err(rstd::move(tunnel).unwrap_err());
         }
     }
     if (origin.scheme.as_str() == "https"_str) {
         body->set_connect_stage(ConnectStage::Tls);
         if (! connection.pending.is_empty()) {
-            (void)co_await connection.close();
+            body->record_cleanup(co_await connection.close());
             co_return Err(protocol_error("unexpected data before tunneled TLS handshake"_Str));
         }
 #if LITO_FEAT_TLS
         if (Instant::now() >= deadline) {
-            (void)co_await connection.close();
+            body->record_cleanup(co_await connection.close());
             co_return Err(Error::Timeout());
         }
         auto                         context = client->options.tls->context();
@@ -423,7 +435,7 @@ auto connect_native(Arc<NativeState>     client,
             return licrypto::tls::ServerName::dns(origin.host.as_str());
         }();
         if (name.is_err()) {
-            (void)co_await connection.close();
+            body->record_cleanup(co_await connection.close());
             co_return Err(tls_error(rstd::move(name).unwrap_err()));
         }
         auto tls =
@@ -440,12 +452,12 @@ auto connect_native(Arc<NativeState>     client,
         if ((! h1 && ! h2) ||
             (h1 && client->options.tls->version_policy() == VersionPolicy::Http2) ||
             (h2 && client->options.tls->version_policy() == VersionPolicy::Http1)) {
-            (void)co_await connection.close();
+            body->record_cleanup(co_await connection.close());
             co_return Err(Error::Unsupported("server negotiated unsupported ALPN"_Str));
         }
         connection.http2 = h2;
 #else
-        (void)co_await connection.close();
+        body->record_cleanup(co_await connection.close());
         co_return Err(Error::Unsupported(String::make("HTTPS requires feature tls"_str)));
 #endif
     }

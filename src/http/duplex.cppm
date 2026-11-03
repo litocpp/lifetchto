@@ -46,6 +46,9 @@ public:
     auto completion() const -> TransferControl { return transfer_.control(); }
     void cancel() const { stream_.cancel(); }
     auto close() const -> coro<Arc<TransferReport>> { return stream_.close(); }
+    auto take_error() -> Option<Error> { return transfer_.take_error(); }
+    auto take_write_error() const -> Option<Error> { return stream_.take_write_error(); }
+    auto take_cleanup_errors() -> Vec<Error> { return transfer_.take_cleanup_errors(); }
 };
 class PendingDuplex {
     Arc<PendingDuplexState> state_;

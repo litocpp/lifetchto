@@ -107,7 +107,7 @@ TEST(ClientResolver, OperatingSystemLookupOwnsAddressesAndErrors) {
     EXPECT_TRUE(rstd::net::lookup_host(""_str, u16(80)).is_err());
     auto invalid = rstd::net::lookup_host("host\0suffix"_str, u16(80));
     ASSERT_TRUE(invalid.is_err());
-    EXPECT_FALSE(invalid.unwrap_err().clone().message.is_empty());
+    EXPECT_FALSE(invalid.unwrap_err().message.is_empty());
 }
 TEST(ClientLifetime, ResolverJoinSurvivesTimeoutAndCanceledCloseWait) {
     auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();

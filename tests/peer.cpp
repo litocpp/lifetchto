@@ -204,6 +204,44 @@ TEST(Peer, BodyTrafficObserverSurvivesIndependentNativeAttemptAndClose) {
     };
     runtime.block_on(run());
 }
+TEST(Peer, NativeAttemptKeepsFailureForItsConsumer) {
+    if (! ::getenv("LIFETCHTO_PEER_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        auto engine = Engine::make(runtime.handle()).unwrap();
+        auto native = http::NativeBackend::make(engine.resources()).unwrap();
+        for (bool body_failure : array<bool, 2> { false, true }) {
+            auto request =
+                traffic_request(url(body_failure ? "/truncated"_str : "/invalid"_str).as_str());
+            auto   prepared  = native.prepare(rstd::move(request.parts), {}).unwrap();
+            auto   operation = native.operation({ rstd::move(prepared), {} }).unwrap();
+            auto   transfer  = engine.submit(rstd::move(operation)).unwrap();
+            auto   response  = co_await transfer.output();
+            String diagnostic;
+            if (body_failure) {
+                EXPECT_TRUE(response.is_ok());
+                auto read = co_await traffic_read(response->body);
+                EXPECT_TRUE(read.as_ref().unwrap_err().is_Protocol());
+                diagnostic  = rstd::format("{}", read.as_ref().unwrap_err());
+                auto report = co_await transfer.control().wait();
+                EXPECT_EQ(report->logical.result.as_ref().unwrap_err().message, diagnostic);
+                EXPECT_TRUE(transfer.take_error()->is_Closed());
+                EXPECT_TRUE((co_await response->body.next()).unwrap_err().is_Closed());
+            } else {
+                EXPECT_TRUE(response.as_ref().unwrap_err().is_Protocol());
+                diagnostic  = rstd::format("{}", response.as_ref().unwrap_err());
+                auto report = co_await transfer.control().wait();
+                EXPECT_EQ(report->logical.result.as_ref().unwrap_err().message, diagnostic);
+            }
+            EXPECT_TRUE(transfer.take_error().is_none());
+        }
+        EXPECT_TRUE((co_await native.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
+
 TEST(Peer, BodyTrafficRetainsConfirmedUploadWhenLaterSourceFails) {
     if (! ::getenv("LIFETCHTO_PEER_PORT")) GTEST_SKIP();
     auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
@@ -635,11 +673,11 @@ TEST(Peer, SourceReleaseFailureRemainsVisibleToClose) {
             auto body = result->take_body().unwrap();
             EXPECT_TRUE((co_await body.bytes(usize())).is_err());
         } else
-            EXPECT_TRUE(result.unwrap_err().is_BodySource());
+            EXPECT_TRUE(result.unwrap_err().is_Closed());
         auto closed = co_await client.close();
         EXPECT_TRUE(closed.is_err());
         if (closed.is_err()) EXPECT_TRUE(closed.unwrap_err().is_BodySource());
-        EXPECT_TRUE((co_await client.close()).is_err());
+        EXPECT_TRUE((co_await client.wait_closed()).is_err());
         EXPECT_EQ(*closes->lock().unwrap(), usize(1));
         co_return empty {};
     };

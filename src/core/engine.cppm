@@ -55,25 +55,105 @@ export auto remaining(Instant deadline) -> Duration {
     auto now = Instant::now();
     return deadline > now ? deadline - now : Duration {};
 }
-export struct CloseReport {
-    Vec<Error> errors;
-    usize      total_errors {};
-    auto       is_ok() const -> bool { return total_errors == usize(); }
-    auto       is_err() const -> bool { return ! is_ok(); }
-    auto       clone() const -> CloseReport {
-        CloseReport result;
-        result.total_errors = total_errors;
-        for (const auto& e : errors) result.errors.push(e.clone());
-        return result;
+export struct CleanupReport {
+    Vec<FailureReport> errors;
+    usize              total_errors {};
+    auto               is_ok() const -> bool { return total_errors == usize(); }
+    auto               is_err() const -> bool { return ! is_ok(); }
+    auto               clone() const -> CleanupReport {
+        CleanupReport report;
+        report.total_errors = total_errors;
+        for (const auto& error : errors) report.errors.push(error.clone());
+        return report;
     }
-    void add(Error error) {
+    void add(FailureReport error) {
         ++total_errors;
         if (errors.len() < usize(16)) errors.push(rstd::move(error));
     }
-    void merge(CloseReport report) {
+    void merge(CleanupReport report) {
         total_errors += report.total_errors;
         for (auto& error : report.errors)
             if (errors.len() < usize(16)) errors.push(rstd::move(error));
+    }
+};
+struct CleanupFields {
+    Vec<Error>    pending;
+    Vec<u64>      seen;
+    CleanupReport report;
+    bool          forwarded {};
+};
+rstd::sync::Mutex<u64> cleanup_sequence { u64(1) };
+struct CleanupState {
+    Option<Arc<CleanupState>>        parent;
+    rstd::sync::Mutex<CleanupFields> fields { CleanupFields {} };
+    explicit CleanupState(Option<Arc<CleanupState>> parent = {}): parent(rstd::move(parent)) {}
+    void note(u64 identity, FailureReport diagnostic) const {
+        {
+            auto f = fields.lock().unwrap();
+            for (auto seen : f->seen)
+                if (seen == identity) return;
+            f->seen.push(u64(identity));
+            f->report.add(diagnostic.clone());
+        }
+        if (parent) (*parent)->note(identity, rstd::move(diagnostic));
+    }
+    void deliver(Error error) const {
+        {
+            auto f = fields.lock().unwrap();
+            if (! f->forwarded) {
+                f->pending.push(rstd::move(error));
+                return;
+            }
+        }
+        if (parent) (*parent)->deliver(rstd::move(error));
+    }
+    void record(Error error) const {
+        if (error.is_Multiple()) {
+            for (auto& item : error.as_Multiple().errors) record(rstd::move(item));
+            return;
+        }
+        if (error.cleanup_id_.is_none()) {
+            auto next         = cleanup_sequence.lock().unwrap();
+            error.cleanup_id_ = Some((*next)++);
+        }
+        note(*error.cleanup_id_, report_failure(error));
+        deliver(rstd::move(error));
+    }
+    auto report() const -> CleanupReport { return fields.lock().unwrap()->report.clone(); }
+    auto take() const -> Option<Vec<Error>> {
+        auto f = fields.lock().unwrap();
+        if (f->forwarded) return None();
+        return Some(rstd::exchange(f->pending, Vec<Error> {}));
+    }
+    void forward() const {
+        Vec<Error> pending;
+        {
+            auto f = fields.lock().unwrap();
+            if (f->forwarded) return;
+            f->forwarded = true;
+            pending      = rstd::move(f->pending);
+        }
+        if (parent)
+            for (auto& error : pending) (*parent)->deliver(rstd::move(error));
+    }
+};
+struct CloseOutcomeFields {
+    Option<Result<empty>> result;
+    CleanupReport         report;
+};
+struct CloseOutcome {
+    rstd::sync::Mutex<CloseOutcomeFields> fields { CloseOutcomeFields {} };
+    void                                  complete(Result<empty> result) {
+        auto f = fields.lock().unwrap();
+        if (result.is_err()) {
+            f->report.total_errors = usize(1);
+            f->report.errors.push(report_failure(result.as_ref().unwrap_err()));
+        }
+        f->result = Some(rstd::move(result));
+    }
+    auto report() const -> CleanupReport { return fields.lock().unwrap()->report.clone(); }
+    auto take_result() const -> Option<Result<empty>> {
+        return fields.lock().unwrap()->result.take();
     }
 };
 export struct ResourceAmount {
@@ -154,8 +234,10 @@ export struct ManagedResource {
     using Funcs = rstd::TraitFuncs<&T::request_stop, &T::release>;
 };
 struct ResourceFlags {
-    bool          started {}, ready {}, done {}, joined {};
-    Option<Error> error;
+    bool started {}, ready {}, done {}, joined {}, result_taken {};
+};
+struct ResourceObservation {
+    rstd::sync::Mutex<Option<CleanupReport>> report { None<CleanupReport>() };
 };
 struct ResourceRecord {
     Arc<rstd::dyn<ManagedResource>>        owner;
@@ -165,8 +247,17 @@ struct ResourceRecord {
     rstd::async::Mutex<empty>              join_gate { empty {} };
     Option<rstd::async::JoinHandle<empty>> task;
     Option<ResourcePermit>                 permit;
-    ResourceRecord(Arc<rstd::dyn<ManagedResource>> owner, rstd::async::RuntimeHandle runtime)
-        : owner(rstd::move(owner)), runtime(rstd::move(runtime)) {}
+    Arc<ResourceObservation>               observation { Arc<ResourceObservation>::make() };
+    Arc<CleanupState>                      cleanup;
+    ResourceRecord(Arc<rstd::dyn<ManagedResource>> owner,
+                   rstd::async::RuntimeHandle      runtime,
+                   Arc<CleanupState>               parent,
+                   bool                            leased = false)
+        : owner(rstd::move(owner)),
+          runtime(rstd::move(runtime)),
+          cleanup(Arc<CleanupState>::make(Some(rstd::move(parent)))) {
+        if (! leased) cleanup->forward();
+    }
     void stop(StopReason reason) {
         {
             auto f = flags.lock().unwrap();
@@ -183,9 +274,10 @@ auto release_resource(Arc<ResourceRecord> record) -> coro<empty> {
     auto result = co_await record->owner->release(ReleaseContext {});
     {
         auto f = record->flags.lock().unwrap();
-        if (result.is_err()) f->error = Some(rstd::move(result).unwrap_err());
-        record->permit = None();
-        f->done        = true;
+        if (result.is_err()) record->cleanup->record(rstd::move(result).unwrap_err());
+        *record->observation->report.lock().unwrap() = Some(record->cleanup->report());
+        record->permit                               = None();
+        f->done                                      = true;
     }
     record->changed.notify();
     co_return empty {};
@@ -204,7 +296,7 @@ void start_release(const Arc<ResourceRecord>& record) {
     }
     record->changed.notify();
 }
-auto wait_resource(Arc<ResourceRecord> record) -> coro<Result<empty>> {
+auto join_resource(Arc<ResourceRecord> record) -> coro<empty> {
     start_release(record);
     for (;;) {
         auto event = record->changed.listen();
@@ -220,31 +312,56 @@ auto wait_resource(Arc<ResourceRecord> record) -> coro<Result<empty>> {
         auto f       = record->flags.lock().unwrap();
         record->task = None();
         f->joined    = true;
-        if (joined.is_err() && f->error.is_none()) f->error = Some(Error::Closed());
+        if (joined.is_err() && ! f->done) {
+            record->cleanup->record(Error::Closed());
+            *record->observation->report.lock().unwrap() = Some(record->cleanup->report());
+        }
     }
+    co_return empty {};
+}
+auto take_resource_result(const Arc<ResourceRecord>& record) -> Option<Result<empty>> {
     auto f = record->flags.lock().unwrap();
-    if (f->error.is_some()) co_return Err(f->error->clone());
-    co_return Ok(empty {});
+    if (! f->joined || f->result_taken) return None();
+    auto errors = record->cleanup->take();
+    if (errors.is_none()) return None();
+    f->result_taken = true;
+    return Some(collect_errors(errors.take().unwrap()));
+}
+auto wait_resource(Arc<ResourceRecord> record) -> coro<Result<empty>> {
+    co_await join_resource(record.clone());
+    auto result = take_resource_result(record);
+    if (result.is_none())
+        co_return Err(Error::Contract("release result already taken or transferred"_Str));
+    co_return result.take().unwrap();
+}
+auto wait_resource_report(Arc<ResourceRecord> record) -> coro<CleanupReport> {
+    co_await join_resource(record.clone());
+    co_return record->cleanup->report();
 }
 struct UnregisteredClose {
     Arc<rstd::dyn<ManagedResource>>     owner;
     rstd::async::Mutex<empty>           gate { empty {} };
     Option<coro<Result<empty>>::Future> task;
-    Option<Error>                       error;
+    CloseOutcome                        outcome;
     bool                                closed {};
     explicit UnregisteredClose(Arc<rstd::dyn<ManagedResource>> owner): owner(rstd::move(owner)) {}
 };
-auto release_unregistered(Arc<UnregisteredClose> state) -> coro<Result<empty>> {
+auto wait_unregistered_close(Arc<UnregisteredClose> state) -> coro<CleanupReport> {
     auto gate = co_await state->gate.lock();
     if (! state->closed) {
         if (state->task.is_none()) state->task = Some(state->owner->release({}).into_future());
         auto result   = co_await rstd::future::by_ref(*state->task);
         state->task   = None();
         state->closed = true;
-        if (result.is_err()) state->error = Some(rstd::move(result).unwrap_err());
+        state->outcome.complete(rstd::move(result));
     }
-    if (state->error.is_some()) co_return Err(state->error->clone());
-    co_return Ok(empty {});
+    co_return state->outcome.report();
+}
+auto release_unregistered(Arc<UnregisteredClose> state) -> coro<Result<empty>> {
+    (void)co_await wait_unregistered_close(state.clone());
+    auto result = state->outcome.take_result();
+    if (result.is_none()) co_return Err(Error::Contract("close result already taken"_Str));
+    co_return result.take().unwrap();
 }
 export template<class T>
 struct ResourceRegistration {
@@ -260,6 +377,11 @@ public:
           owner(rstd::move(owner)),
           cleanup_(Arc<UnregisteredClose>::make(this->owner.clone())) {}
     void request_close() const { owner->request_stop(StopReason::Abandoned); }
+    auto wait_closed() const -> coro<CleanupReport> {
+        request_close();
+        return wait_unregistered_close(cleanup_.clone());
+    }
+    auto take_close_result() -> Option<Result<empty>> { return cleanup_->outcome.take_result(); }
     auto close() const -> coro<Result<empty>> {
         request_close();
         return release_unregistered(cleanup_.clone());
@@ -278,7 +400,10 @@ public:
     auto operator=(ResourceLease&& other) noexcept -> ResourceLease& {
         if (this != &other) {
             request_stop();
-            if (record_) start_release(record_);
+            if (record_) {
+                record_->cleanup->forward();
+                start_release(record_);
+            }
             access_ = rstd::move(other.access_);
             record_ = rstd::move(other.record_);
         }
@@ -287,6 +412,7 @@ public:
     ~ResourceLease() {
         if (record_) {
             request_stop();
+            record_->cleanup->forward();
             start_release(record_);
         }
     }
@@ -295,6 +421,7 @@ public:
     auto is_released() const -> bool { return record_->finished(); }
     auto into_scope() && -> T {
         auto registration = rstd::move(record_);
+        registration->cleanup->forward();
         return rstd::move(access_);
     }
     void request_stop() const {
@@ -304,11 +431,16 @@ public:
         start_release(record_);
         return wait_resource(record_.clone());
     }
+    auto wait_released() const -> coro<CleanupReport> {
+        return wait_resource_report(record_.clone());
+    }
+    auto take_release_result() const -> Option<Result<empty>> {
+        return take_resource_result(record_);
+    }
 };
 struct ScopeFields {
     Vec<Arc<ResourceRecord>> entries;
     bool                     closed {};
-    CloseReport              past;
 };
 struct ScopeState {
     rstd::async::RuntimeHandle               runtime;
@@ -316,8 +448,13 @@ struct ScopeState {
     Option<rstd::sync::Weak<ResourceRecord>> parent_record;
     Cancellation                             cancellation;
     rstd::sync::Mutex<ScopeFields>           fields { ScopeFields {} };
-    ScopeState(rstd::async::RuntimeHandle runtime, Arc<BudgetState> budget)
-        : runtime(rstd::move(runtime)), budget(rstd::move(budget)) {}
+    Arc<CleanupState>                        cleanup;
+    ScopeState(rstd::async::RuntimeHandle runtime,
+               Arc<BudgetState>           budget,
+               Option<Arc<CleanupState>>  parent = {})
+        : runtime(rstd::move(runtime)),
+          budget(rstd::move(budget)),
+          cleanup(Arc<CleanupState>::make(rstd::move(parent))) {}
 };
 void seal_scope(const Arc<ScopeState>& scope,
                 bool                   stop,
@@ -334,44 +471,64 @@ void seal_scope(const Arc<ScopeState>& scope,
         start_release(record);
     }
 }
-auto drain_scope(Arc<ScopeState> scope) -> coro<CloseReport> {
+auto drain_scope(Arc<ScopeState> scope) -> coro<CleanupReport> {
     Vec<Arc<ResourceRecord>> entries;
     {
         auto f = scope->fields.lock().unwrap();
         for (const auto& record : f->entries) entries.push(record.clone());
     }
-    for (auto& record : entries) (void)co_await wait_resource(record.clone());
-    auto f = scope->fields.lock().unwrap();
-    for (auto& record : f->entries) {
-        auto flags = record->flags.lock().unwrap();
-        if (flags->error.is_some()) f->past.add(flags->error->clone());
+    for (auto& record : entries) co_await join_resource(record.clone());
+    {
+        auto f = scope->fields.lock().unwrap();
+        f->entries.clear();
     }
-    f->entries.clear();
-    co_return f->past.clone();
+    entries.clear();
+    co_return scope->cleanup->report();
 }
 auto admit_resource(const Arc<ScopeState>& scope, Arc<ResourceRecord> record) -> Result<empty> {
     auto f = scope->fields.lock().unwrap();
     if (f->closed || scope->cancellation.is_canceled()) return Err(Error::Closed());
     for (usize i; i < f->entries.len();) {
         if (f->entries[i]->finished()) {
-            auto old   = f->entries.remove(i);
-            auto flags = old->flags.lock().unwrap();
-            if (flags->error.is_some()) f->past.add(flags->error->clone());
+            f->entries.remove(i);
         } else
             ++i;
     }
     f->entries.push(rstd::move(record));
     return Ok(empty {});
 }
+auto observe_resource(rstd::sync::Weak<ResourceRecord> record, Arc<ResourceObservation> observation)
+    -> coro<CleanupReport> {
+    auto owner = record.upgrade();
+    if (owner) co_await join_resource(rstd::move(owner));
+    auto report = observation->report.lock().unwrap();
+    if (report->is_some()) co_return (**report).clone();
+    CleanupReport unavailable;
+    unavailable.total_errors = usize(1);
+    unavailable.errors.push(report_failure(Error::Closed()));
+    co_return rstd::move(unavailable);
+}
 export class TaskControl {
-    Arc<ResourceRecord> record_;
+    rstd::sync::Weak<ResourceRecord> record_;
+    Arc<ResourceObservation>         observation_;
+    TaskControl(rstd::sync::Weak<ResourceRecord> record, Arc<ResourceObservation> observation)
+        : record_(rstd::move(record)), observation_(rstd::move(observation)) {}
 
 public:
-    explicit TaskControl(Arc<ResourceRecord> record): record_(rstd::move(record)) {}
-    auto clone() const -> TaskControl { return TaskControl(record_.clone()); }
-    void cancel() const { record_->stop(StopReason::Canceled); }
-    auto is_finished() const -> bool { return record_->finished(); }
-    auto wait() const -> coro<Result<empty>> { return wait_resource(record_.clone()); }
+    explicit TaskControl(const Arc<ResourceRecord>& record)
+        : record_(record.downgrade()), observation_(record->observation.clone()) {}
+    auto clone() const -> TaskControl { return TaskControl(record_.clone(), observation_.clone()); }
+    void cancel() const {
+        auto record = record_.upgrade();
+        if (record) record->stop(StopReason::Canceled);
+    }
+    auto is_finished() const -> bool {
+        auto record = record_.upgrade();
+        return ! record || record->finished();
+    }
+    auto wait() const -> coro<CleanupReport> {
+        return observe_resource(record_.clone(), observation_.clone());
+    }
 };
 template<class D>
 struct TaskState {
@@ -416,6 +573,7 @@ public:
     auto deadline() const -> Option<Instant> { return deadline_; }
     auto runtime() const -> rstd::async::RuntimeHandle { return scope_->runtime.clone(); }
     auto handle() const -> EngineHandle;
+    void record_cleanup_error(Error error) const { scope_->cleanup->record(rstd::move(error)); }
     auto usage() const -> ResourceAmount {
         auto f = scope_->budget->fields.lock().unwrap();
         return f->used;
@@ -436,7 +594,8 @@ public:
         if (permit.is_err())
             return Err(Rejected<ResourceRegistration<T>> {
                 rstd::move(permit).unwrap_err(), { rstd::move(access), rstd::move(owner) } });
-        auto record    = Arc<ResourceRecord>::make(owner.clone(), scope_->runtime.clone());
+        auto record = Arc<ResourceRecord>::make(
+            owner.clone(), scope_->runtime.clone(), scope_->cleanup.clone(), true);
         record->permit = Some(rstd::move(permit).unwrap());
         auto admitted  = admit_resource(scope_, record.clone());
         if (admitted.is_err())
@@ -485,21 +644,32 @@ export struct Progress {
 export struct ProtocolCompletion {
     Result<empty> result;
     RemoteOutcome remote { RemoteOutcome::Unknown };
-    auto          clone() const -> ProtocolCompletion {
-        return { result.is_ok() ? Result<empty>(Ok(empty {}))
-                                : Result<empty>(Err(result.as_ref().unwrap_err().clone())),
-                 remote };
+    // A dependent operation may own the original error while this result reports closure.
+    Option<FailureReport> diagnostic;
+};
+export struct ProtocolReport {
+    rstd::Result<empty, FailureReport> result;
+    RemoteOutcome                      remote { RemoteOutcome::Unknown };
+    static auto capture(const ProtocolCompletion& completion) -> ProtocolReport {
+        using ReportResult = rstd::Result<empty, FailureReport>;
+        return { completion.result.is_ok()
+                     ? ReportResult(Ok(empty {}))
+                     : ReportResult(
+                           Err(completion.diagnostic.is_some()
+                                   ? completion.diagnostic->clone()
+                                   : report_failure(completion.result.as_ref().unwrap_err()))),
+                 completion.remote };
     }
 };
 export struct TransferReport {
-    const ProtocolCompletion logical;
+    const ProtocolReport     logical;
     const Option<StopReason> stop_requested;
     const Progress           progress;
-    const CloseReport        cleanup;
-    TransferReport(ProtocolCompletion logical,
+    const CleanupReport      cleanup;
+    TransferReport(ProtocolReport     logical,
                    Option<StopReason> stop,
                    Progress           progress,
-                   CloseReport        cleanup)
+                   CleanupReport      cleanup)
         : logical(rstd::move(logical)),
           stop_requested(stop),
           progress(progress),
@@ -705,12 +875,12 @@ struct PreparedState {
     rstd::sync::Mutex<PreparedFlags>             flags { PreparedFlags {} };
     rstd::async::Mutex<empty>                    gate { empty {} };
     Option<typename coro<Result<empty>>::Future> release;
-    Option<Error>                                error;
+    CloseOutcome                                 outcome;
     bool                                         closed {};
     explicit PreparedState(Arc<rstd::dyn<ProtocolDriver<T>>> driver): driver(rstd::move(driver)) {}
 };
 template<class T>
-auto close_prepared(Arc<PreparedState<T>> state) -> coro<Result<empty>> {
+auto wait_prepared_close(Arc<PreparedState<T>> state) -> coro<CleanupReport> {
     auto gate = co_await state->gate.lock();
     if (! state->closed) {
         if (state->release.is_none())
@@ -718,10 +888,16 @@ auto close_prepared(Arc<PreparedState<T>> state) -> coro<Result<empty>> {
         auto result    = co_await rstd::future::by_ref(*state->release);
         state->release = None();
         state->closed  = true;
-        if (result.is_err()) state->error = Some(rstd::move(result).unwrap_err());
+        state->outcome.complete(rstd::move(result));
     }
-    if (state->error.is_some()) co_return Err(state->error->clone());
-    co_return Ok(empty {});
+    co_return state->outcome.report();
+}
+template<class T>
+auto close_prepared(Arc<PreparedState<T>> state) -> coro<Result<empty>> {
+    (void)co_await wait_prepared_close(state.clone());
+    auto result = state->outcome.take_result();
+    if (result.is_none()) co_return Err(Error::Contract("close result already taken"_Str));
+    co_return result.take().unwrap();
 }
 export template<class T>
 class PreparedOperation {
@@ -761,11 +937,17 @@ public:
         request_close();
         return close_prepared(state_.clone());
     }
+    auto wait_closed() const -> coro<CleanupReport> {
+        request_close();
+        return wait_prepared_close(state_.clone());
+    }
+    auto take_close_result() -> Option<Result<empty>> { return state_->outcome.take_result(); }
 };
 template<class T>
 struct OutputFields {
-    Option<T> output;
-    bool      published {}, taken {}, reading {};
+    Option<T>     output;
+    Option<Error> error;
+    bool          published {}, taken {}, reading {};
 };
 template<class T>
 struct OutputState {
@@ -825,13 +1007,15 @@ auto read_output(Arc<OutputState<T>> state) -> coro<Result<T>> {
                 co_return Ok(f->output.take().unwrap());
             }
         }
-        if (state->operation->scope->cancellation.is_canceled())
-            co_return Err(stop_error(*state->operation->scope->cancellation.reason()));
         {
             auto f = state->operation->fields.lock().unwrap();
             if (f->report.is_some()) {
-                if ((*f->report)->logical.result.is_err())
-                    co_return Err((*f->report)->logical.result.as_ref().unwrap_err().clone());
+                auto output = state->fields.lock().unwrap();
+                if (output->error) {
+                    output->taken = true;
+                    co_return Err(output->error.take().unwrap());
+                }
+                if ((*f->report)->logical.result.is_err()) co_return Err(Error::OutputTaken());
                 co_return Err(Error::Contract(String::make("driver completed without output"_str)));
             }
         }
@@ -848,16 +1032,31 @@ public:
     Transfer(const Transfer&)     = delete;
     auto operator=(Transfer&& other) noexcept -> Transfer& {
         if (this != &other) {
-            if (state_) stop_operation(state_->operation, StopReason::Abandoned);
+            if (state_) {
+                stop_operation(state_->operation, StopReason::Abandoned);
+                state_->operation->scope->cleanup->forward();
+            }
             state_ = rstd::move(other.state_);
         }
         return *this;
     }
     ~Transfer() {
-        if (state_) stop_operation(state_->operation, StopReason::Abandoned);
+        if (state_) {
+            stop_operation(state_->operation, StopReason::Abandoned);
+            state_->operation->scope->cleanup->forward();
+        }
     }
     auto output() const -> coro<Result<T>> { return read_output(state_.clone()); }
+    // Errors after output publication remain owned by this transfer, not its report.
+    auto take_error() -> Option<Error> {
+        auto f = state_->fields.lock().unwrap();
+        if (! f->published || ! f->taken) return None();
+        return f->error.take();
+    }
     auto control() const -> TransferControl { return TransferControl(state_->operation.clone()); }
+    auto take_cleanup_errors() -> Vec<Error> {
+        return state_->operation->scope->cleanup->take().unwrap_or(Vec<Error> {});
+    }
 };
 template<class T>
 struct DriverResource {
@@ -881,9 +1080,6 @@ struct OperationResource {
             state->task = None();
             if (joined.is_err()) co_return Err(Error::Closed());
         }
-        auto f = state->operation->fields.lock().unwrap();
-        if (f->report.is_some() && (*f->report)->cleanup.is_err())
-            co_return Err((*f->report)->cleanup.errors[usize()].clone());
         co_return Ok(empty {});
     }
 };
@@ -953,8 +1149,8 @@ auto run_operation(Arc<OutputState<T>> state) -> coro<empty> {
         f->phase = TransferPhase::Releasing;
     }
     auto released = co_await state->driver->release({});
+    if (released.is_err()) operation->scope->cleanup->record(rstd::move(released).unwrap_err());
     auto cleanup  = co_await drain_scope(operation->scope.clone());
-    if (released.is_err()) cleanup.add(rstd::move(released).unwrap_err());
     auto progress = [&] {
         auto f            = operation->fields.lock().unwrap();
         auto progress     = f->progress;
@@ -962,12 +1158,14 @@ auto run_operation(Arc<OutputState<T>> state) -> coro<empty> {
         progress.attempts = attempts->used;
         return progress;
     }();
-    auto report = Arc<TransferReport>::make(rstd::move(logical),
+    auto report = Arc<TransferReport>::make(ProtocolReport::capture(logical),
                                             operation->scope->cancellation.reason(),
                                             progress,
                                             rstd::move(cleanup));
     {
-        auto f    = operation->fields.lock().unwrap();
+        auto f      = operation->fields.lock().unwrap();
+        auto output = state->fields.lock().unwrap();
+        if (logical.result.is_err()) output->error = Some(rstd::move(logical.result).unwrap_err());
         f->report = Some(rstd::move(report));
         f->phase  = TransferPhase::Released;
     }
@@ -985,11 +1183,15 @@ public:
     auto operator=(TransferScope&& other) noexcept -> TransferScope& {
         if (this != &other) {
             request_close();
+            if (scope_) scope_->cleanup->forward();
             scope_ = rstd::move(other.scope_);
         }
         return *this;
     }
-    ~TransferScope() { request_close(); }
+    ~TransferScope() {
+        request_close();
+        if (scope_) scope_->cleanup->forward();
+    }
     auto resources() const -> ResourceContext { return ResourceContext(scope_.clone()); }
     auto handle() const -> EngineHandle;
     template<class T>
@@ -1007,10 +1209,14 @@ public:
             }
         }
     }
-    auto close() const -> coro<CloseReport> {
+    auto close() const -> coro<CleanupReport> {
         request_close();
         return drain_scope(scope_.clone());
     }
+    auto take_close_errors() -> Vec<Error> {
+        return scope_->cleanup->take().unwrap_or(Vec<Error> {});
+    }
+    void record_cleanup_error(Error error) { scope_->cleanup->record(rstd::move(error)); }
 };
 export using ScopeHandle = EngineHandle;
 struct ScopeResource {
@@ -1018,8 +1224,7 @@ struct ScopeResource {
     void            request_stop(StopReason reason) const { seal_scope(scope, true, reason); }
     auto            release(ReleaseContext) const -> coro<Result<empty>> {
         seal_scope(scope, false);
-        auto result = co_await drain_scope(scope.clone());
-        if (result.is_err()) co_return Err(result.errors[usize()].clone());
+        (void)co_await drain_scope(scope.clone());
         co_return Ok(empty {});
     }
 };
@@ -1078,7 +1283,8 @@ public:
         return scope_.submit(rstd::move(operation), options);
     }
     void request_close() const { scope_.request_close(); }
-    auto close() const -> coro<CloseReport> { return scope_.close(); }
+    auto close() const -> coro<CleanupReport> { return scope_.close(); }
+    auto take_close_errors() -> Vec<Error> { return scope_.take_close_errors(); }
 };
 } // namespace lifetchto
 export namespace rstd
@@ -1119,9 +1325,11 @@ auto EngineHandle::scope(ScopeOptions) const -> Result<TransferScope> {
     auto permit =
         lifetchto::try_reserve(parent->budget.clone(), ResourceAmount { .resources = usize(1) });
     if (permit.is_err()) return Err(rstd::move(permit).unwrap_err());
-    auto scope           = Arc<ScopeState>::make(parent->runtime.clone(), parent->budget.clone());
-    auto owner           = Arc<rstd::dyn<ManagedResource>>::make(ScopeResource { scope.clone() });
-    auto record          = Arc<ResourceRecord>::make(rstd::move(owner), parent->runtime.clone());
+    auto scope = Arc<ScopeState>::make(
+        parent->runtime.clone(), parent->budget.clone(), Some(parent->cleanup.clone()));
+    auto owner  = Arc<rstd::dyn<ManagedResource>>::make(ScopeResource { scope.clone() });
+    auto record = Arc<ResourceRecord>::make(
+        rstd::move(owner), parent->runtime.clone(), parent->cleanup.clone());
     record->permit       = Some(rstd::move(permit).unwrap());
     scope->parent_record = Some(record.downgrade());
     auto admitted        = admit_resource(parent, record.clone());
@@ -1145,7 +1353,8 @@ auto ResourceContext::spawn(D work) -> rstd::Result<TaskControl, Rejected<D>> {
     auto state  = Arc<TaskState<D>>::make(rstd::move(work));
     auto record = Arc<ResourceRecord>::make(
         Arc<rstd::dyn<ManagedResource>>::make(TaskResource<D> { state.clone() }),
-        scope_->runtime.clone());
+        scope_->runtime.clone(),
+        scope_->cleanup.clone());
     auto lock = scope_->fields.lock().unwrap();
     if (lock->closed || scope_->cancellation.is_canceled()) {
         auto f = state->work.lock().unwrap();
@@ -1177,7 +1386,8 @@ auto submit_operation(Arc<ScopeState>            parent,
     if (permit.is_err())
         return Err(Rejected<PreparedOperation<T>> { rstd::move(permit).unwrap_err(),
                                                     rstd::move(prepared) });
-    auto scope    = Arc<ScopeState>::make(parent->runtime.clone(), parent->budget.clone());
+    auto scope = Arc<ScopeState>::make(
+        parent->runtime.clone(), parent->budget.clone(), Some(parent->cleanup.clone()));
     auto attempts = inherited.is_some() ? inherited.take().unwrap()
                                         : Arc<AttemptBudget>::make(options.max_attempts);
     auto operation =
@@ -1185,16 +1395,15 @@ auto submit_operation(Arc<ScopeState>            parent,
     auto output = Arc<OutputState<T>>::make(operation.clone(), prepared.driver());
     auto record = Arc<ResourceRecord>::make(
         Arc<rstd::dyn<ManagedResource>>::make(OperationResource<T> { output.clone() }),
-        parent->runtime.clone());
+        parent->runtime.clone(),
+        scope->cleanup.clone());
     {
         auto f = parent->fields.lock().unwrap();
         if (f->closed || parent->cancellation.is_canceled())
             return Err(Rejected<PreparedOperation<T>> { Error::Closed(), rstd::move(prepared) });
         for (usize i; i < f->entries.len();) {
             if (f->entries[i]->finished()) {
-                auto old   = f->entries.remove(i);
-                auto flags = old->flags.lock().unwrap();
-                if (flags->error.is_some()) f->past.add(flags->error->clone());
+                f->entries.remove(i);
             } else
                 ++i;
         }

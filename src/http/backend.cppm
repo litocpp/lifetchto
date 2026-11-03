@@ -235,6 +235,8 @@ public:
         -> rstd::Result<PreparedOperation<DuplexStream>, Rejected<DuplexRequest>>;
     void request_close() const;
     auto close() const -> coro<Result<empty>>;
+    auto wait_closed() const -> coro<CleanupReport>;
+    auto take_close_result() const -> Option<Result<empty>>;
 };
 } // namespace lifetchto::http
 export namespace rstd

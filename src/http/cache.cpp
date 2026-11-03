@@ -7,7 +7,10 @@ namespace lifetchto::http
 struct CacheBodyOwner {
     BodyControl control;
     void        request_stop(StopReason reason) const { control.cancel(reason); }
-    auto        release(ReleaseContext) const { return control.close(); }
+    auto        release(ReleaseContext) const -> coro<Result<empty>> {
+        (void)co_await control.close();
+        co_return Ok(empty {});
+    }
 };
 auto open_snapshot(Arc<rstd::dyn<CacheSnapshot>> snapshot, TransferContext context)
     -> coro<Result<ResponseBody>>;
@@ -340,7 +343,9 @@ auto open_snapshot(Arc<rstd::dyn<CacheSnapshot>> snapshot, TransferContext conte
         empty {}, Arc<rstd::dyn<ManagedResource>>::make(CacheBodyOwner { body->completion() }));
     if (registered.is_err()) {
         auto rejected = rstd::move(registered).unwrap_err();
-        (void)co_await rejected.input.close();
+        auto closed   = co_await rejected.input.close();
+        if (closed.is_err())
+            context.resources().record_cleanup_error(rstd::move(closed).unwrap_err());
         co_return Err(rstd::move(rejected.error));
     }
     (void)rstd::move(registered).unwrap().into_scope();

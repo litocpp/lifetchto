@@ -31,8 +31,7 @@ struct NativeDuplexState {
     }
     void ready(Result<empty> value) const {
         auto f = fields.lock().unwrap();
-        if (value.is_err() && f->channel.is_some())
-            f->channel->fail(value.as_ref().unwrap_err().clone());
+        if (value.is_err() && f->channel.is_some()) f->channel->request_stop();
         f->ready = Some(rstd::move(value));
         changed.notify();
     }
@@ -136,7 +135,7 @@ struct NativeDuplexConnect {
             co_return Ok(empty {});
         }
         if (connection->http2) {
-            (void)co_await connection->close();
+            state->body->record_cleanup(co_await connection->close());
             state->ready(Err(Error::Unsupported("duplex requires an HTTP/1 TLS profile"_Str)));
             co_return Ok(empty {});
         }
@@ -204,7 +203,13 @@ struct NativeDuplexOwner {
         state->native_done->store(true);
         auto backend = state->backend.upgrade();
         if (backend) backend->changed.notify();
-        co_return rstd::move(closed);
+        Vec<Error> errors;
+        {
+            auto f = state->body->fields.lock().unwrap();
+            errors = rstd::move(f->cleanup_errors);
+        }
+        if (closed.is_err()) errors.push(rstd::move(closed).unwrap_err());
+        co_return collect_errors(rstd::move(errors));
     }
 };
 struct NativeDuplexOperation {
@@ -319,7 +324,7 @@ auto NativeDuplexDriver::run(TransferContext context, OutputSender<DuplexStream>
             auto f = state->fields.lock().unwrap();
             if (f->ready.is_some()) {
                 if (f->ready->is_err())
-                    co_return ProtocolCompletion { Err(f->ready->as_ref().unwrap_err().clone()),
+                    co_return ProtocolCompletion { Err(rstd::move(*f->ready).unwrap_err()),
                                                    RemoteOutcome::Unknown };
                 break;
             }
@@ -328,7 +333,9 @@ auto NativeDuplexDriver::run(TransferContext context, OutputSender<DuplexStream>
     }
     auto sent = output.publish(channel->take_stream().unwrap());
     if (sent.is_err()) channel->request_stop();
-    co_return ProtocolCompletion { co_await channel->wait_finished(), RemoteOutcome::Unknown };
+    co_return ProtocolCompletion { co_await channel->wait_finished(),
+                                   RemoteOutcome::Unknown,
+                                   channel->failure() };
 }
 auto NativeBackend::duplex(DuplexRequest input) const
     -> rstd::Result<PreparedOperation<DuplexStream>, Rejected<DuplexRequest>> {

@@ -173,7 +173,7 @@ TEST(TcpConnector, CleanupFailureRemainsVisibleToClientClose) {
             (co_await client.send(TestRequest::make(url.as_ref()).unwrap(), rstd::move(options)))
                 .is_err());
         EXPECT_TRUE((co_await client.close()).is_err());
-        EXPECT_TRUE((co_await client.close()).is_err());
+        EXPECT_TRUE((co_await client.wait_closed()).is_err());
         EXPECT_EQ(stats->lock().unwrap()->released, usize(1));
         co_return empty {};
     };

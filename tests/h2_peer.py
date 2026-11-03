@@ -59,6 +59,7 @@ class Handler(socketserver.BaseRequestHandler):
                     while b"\r\n\r\n" not in message:
                         data = sock.recv(16384)
                         if not data:
+                            sock.unwrap().close()
                             return
                         message += data
                     sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")

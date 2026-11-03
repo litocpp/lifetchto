@@ -55,7 +55,7 @@ auto MemoryCookieJar::import_netscape(ref<str> input, i64 now) const -> Result<e
     auto parsed = f->storage.import_netscape(input, now);
     if (parsed.is_err())
         return Err(Error::Extension("cookie file"_Str,
-                                    Arc<rstd::dyn<rstd::error::Error>>::make(parsed.unwrap_err())));
+                                    Box<rstd::dyn<rstd::error::Error>>::make(parsed.unwrap_err())));
     return Ok(empty {});
 }
 auto MemoryCookieJar::export_netscape(i64 now) const -> Result<String> {

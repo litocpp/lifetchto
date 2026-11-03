@@ -21,9 +21,8 @@ auto ExecutionObserver::wait() const -> coro<Result<ExecutionReport>> {
     return observe(state_.clone());
 }
 struct ClientFields {
-    usize               handles { 1 };
-    bool                closed {};
-    Option<CloseReport> close_report;
+    usize handles { 1 };
+    bool  closed {};
 };
 struct ClientState {
     TransferScope                   scope;
@@ -65,27 +64,20 @@ void drop_http_client(const Arc<ClientState>& state) {
 }
 auto finish_http_client(Arc<ClientState> state) -> coro<Result<empty>> {
     stop_http_client(state);
-    auto report = co_await state->scope.close();
+    (void)co_await state->scope.close();
     if (state->binding.is_Owned()) {
         auto closed = co_await state->backend->close();
-        if (closed.is_err()) report.add(rstd::move(closed).unwrap_err());
+        if (closed.is_err()) state->scope.record_cleanup_error(rstd::move(closed).unwrap_err());
     }
     if (state->config.cache.is_some() && state->config.cache->is_Store() &&
         state->config.cache->as_Store().value.is_Owned()) {
         auto closed = co_await state->config.cache->as_Store().value.store()->close();
-        if (closed.is_err()) report.add(rstd::move(closed).unwrap_err());
+        if (closed.is_err()) state->scope.record_cleanup_error(rstd::move(closed).unwrap_err());
     }
     if (state->config.cookies.is_some() && state->config.cookies->is_Owned()) {
         auto closed = co_await state->config.cookies->jar()->close();
-        if (closed.is_err()) report.add(rstd::move(closed).unwrap_err());
+        if (closed.is_err()) state->scope.record_cleanup_error(rstd::move(closed).unwrap_err());
     }
-    Option<Error> error;
-    if (report.is_err()) error = Some(report.errors[usize()].clone());
-    {
-        auto f          = state->fields.lock().unwrap();
-        f->close_report = Some(rstd::move(report));
-    }
-    if (error.is_some()) co_return Err(error.take().unwrap());
     co_return Ok(empty {});
 }
 struct ClientOwner {
@@ -96,7 +88,7 @@ struct ClientOwner {
     }
 };
 struct BodyOwner {
-    BodyControl control;
+    BodyCleanup control;
     void        request_stop(StopReason reason) const { control.cancel(reason); }
     auto        release(ReleaseContext) const -> coro<Result<empty>> { return control.close(); }
 };
@@ -109,7 +101,7 @@ struct LogicalState {
     ExecuteOptions                   options;
     ExecutionPolicy                  policy;
     Arc<ExecutionObserverState>      report;
-    Option<Error>                    release_error;
+    Vec<Error>                       release_errors;
     rstd::sync::Mutex<LogicalFields> fields { LogicalFields {} };
     LogicalState(Arc<ClientState>            client,
                  ExecutionRequest            request,
@@ -176,7 +168,7 @@ void record_attempt(const Arc<LogicalState>&      state,
                                 report->progress,
                                 report->logical.result.is_err()
                                     ? Some(report->logical.result.as_ref().unwrap_err().clone())
-                                    : None<Error>() });
+                                    : None<FailureReport>() });
     else
         f->facts.history_truncated = true;
 }
@@ -262,7 +254,7 @@ auto decide_retry(const RetryPolicy&            policy,
     return Ok(RetryDecision { retry, *delay });
 }
 struct TapFields {
-    bool active { true }, canceled {};
+    bool active { true }, canceled {}, attempt_failed {};
 };
 struct TapState {
     ResponseBody                 body;
@@ -311,7 +303,9 @@ auto tap_next(Arc<TapState> state) -> coro<Result<Option<Bytes>>> {
         auto report = co_await state->attempt.wait();
         if (report->logical.result.is_err()) {
             state->writer->request_abort();
-            co_return Err(report->logical.result.as_ref().unwrap_err().clone());
+            state->fields.lock().unwrap()->attempt_failed = true;
+            // The attempt owner forwards the original failure after the body is released.
+            co_return Err(Error::Closed());
         }
         auto trailers = state->body.trailers();
         if (trailers.is_err()) {
@@ -352,10 +346,13 @@ struct TapSource {
         state->body.cancel();
     }
     auto close() const -> coro<Result<empty>> {
-        auto closed  = co_await state->body.close();
-        auto aborted = co_await state->writer->abort();
-        if (closed.is_err()) co_return Err(rstd::move(closed).unwrap_err());
-        co_return rstd::move(aborted);
+        (void)co_await state->body.close();
+        auto       closed  = state->body.take_close_result();
+        auto       aborted = co_await state->writer->abort();
+        Vec<Error> errors;
+        if (closed.is_some() && closed->is_err()) errors.push(rstd::move(*closed).unwrap_err());
+        if (aborted.is_err()) errors.push(rstd::move(aborted).unwrap_err());
+        co_return collect_errors(rstd::move(errors));
     }
 };
 struct LogicalDriver {
@@ -373,11 +370,9 @@ struct LogicalDriver {
     auto release(ReleaseContext) -> coro<Result<empty>> {
         if (state->request.is_some()) {
             auto closed = co_await state->request->body.close();
-            if (closed.is_err() && state->release_error.is_none())
-                state->release_error = Some(rstd::move(closed).unwrap_err());
+            if (closed.is_err()) state->release_errors.push(rstd::move(closed).unwrap_err());
         }
-        if (state->release_error.is_some()) co_return Err(state->release_error->clone());
-        co_return Ok(empty {});
+        co_return collect_errors(rstd::exchange(state->release_errors, Vec<Error> {}));
     }
 };
 } // namespace lifetchto::http
@@ -416,11 +411,14 @@ auto publish_response(const Arc<LogicalState>&      state,
         f->body = Some(control.clone());
     }
     auto registered = context.resources().attach(
-        empty {}, Arc<rstd::dyn<ManagedResource>>::make(BodyOwner { control.clone() }));
+        empty {},
+        Arc<rstd::dyn<ManagedResource>>::make(BodyOwner { message.body.take_cleanup().unwrap() }));
     if (registered.is_err()) {
         auto rejected = rstd::move(registered).unwrap_err();
         rejected.input.request_close();
-        (void)co_await rejected.input.close();
+        auto closed = co_await rejected.input.close();
+        if (closed.is_err())
+            context.resources().record_cleanup_error(rstd::move(closed).unwrap_err());
         co_return ProtocolCompletion { Err(rstd::move(rejected.error)), RemoteOutcome::Unknown };
     }
     auto owner = rstd::move(registered).unwrap();
@@ -434,7 +432,7 @@ auto publish_response(const Arc<LogicalState>&      state,
     auto published = output.publish(rstd::move(message));
     if (published.is_err()) control.cancel();
     auto completed = co_await control.wait();
-    co_return ProtocolCompletion { rstd::move(completed), remote };
+    co_return ProtocolCompletion { rstd::move(completed), remote, control.failure() };
 }
 auto cached_response(const Arc<LogicalState>&       state,
                      TransferContext                context,
@@ -614,14 +612,16 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
             auto rejected = rstd::move(operation).unwrap_err();
             rejected.input.body.cancel();
             auto closed = co_await rejected.input.body.close();
-            if (closed.is_err()) state->release_error = Some(rstd::move(closed).unwrap_err());
+            if (closed.is_err()) state->release_errors.push(rstd::move(closed).unwrap_err());
             co_return ProtocolCompletion { Err(rstd::move(rejected.error)),
                                            RemoteOutcome::NotDispatched };
         }
         auto submitted = context.submit(rstd::move(operation).unwrap());
         if (submitted.is_err()) {
             auto rejected = rstd::move(submitted).unwrap_err();
-            (void)co_await rejected.input.close();
+            auto closed   = co_await rejected.input.close();
+            if (closed.is_err())
+                context.resources().record_cleanup_error(rstd::move(closed).unwrap_err());
             co_return ProtocolCompletion { Err(rstd::move(rejected.error)),
                                            RemoteOutcome::NotDispatched };
         }
@@ -632,7 +632,7 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
         if (response.is_err()) {
             auto report = co_await attempt_control.wait();
             record_attempt(state, request.parts, {}, report);
-            auto error = response.as_ref().unwrap_err().clone();
+            auto error = rstd::move(response).unwrap_err();
             if (state->policy.retry.is_some() && ! context.cancellation().is_canceled()) {
                 auto decision = decide_retry(*state->policy.retry,
                                              request.parts,
@@ -693,10 +693,8 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
             auto report = co_await attempt_control.wait();
             record_attempt(state, request.parts, Some(status), report);
             if (report->logical.result.is_err())
-                co_return ProtocolCompletion {
-                    Err(report->logical.result.as_ref().unwrap_err().clone()),
-                    report->logical.remote
-                };
+                co_return ProtocolCompletion { Err(attempt.take_error().unwrap()),
+                                               report->logical.remote };
             auto metadata = cached->metadata().clone();
             metadata.head.headers =
                 lihttpto::merge_not_modified(metadata.head.headers, message.head.headers);
@@ -803,7 +801,7 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
                     if (get) {
                         auto closed = co_await request.body.close();
                         if (closed.is_err())
-                            state->release_error = Some(rstd::move(closed).unwrap_err());
+                            state->release_errors.push(rstd::move(closed).unwrap_err());
                         request.body         = UploadPlan::empty();
                         request.parts.method = lihttpto::Method::parse("GET"_str).unwrap();
                         for (auto name : array<ref<str>, 5> { "content-length"_str,
@@ -854,6 +852,7 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
                 continue;
             }
         }
+        Option<Arc<TapState>> cache_tap;
         if (eligible && have_generation && store.is_some() && status == u16(200)) {
             auto policy = lihttpto::CachePolicy::make(message.head.headers, requested, cache_now());
             bool reusable = policy.fields.reusable &&
@@ -895,6 +894,7 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
                                                        attempt_control.clone(),
                                                        context.clone(),
                                                        client->config.store_failure);
+                    cache_tap    = Some(tap.clone());
                     message.body = ResponseBody::from_source(
                         Arc<rstd::dyn<ResponseSource>>::make(TapSource { rstd::move(tap) }));
                 }
@@ -904,8 +904,17 @@ auto LogicalDriver::run(TransferContext context, OutputSender<ResponseMessage> o
             state, context.clone(), rstd::move(output), rstd::move(message));
         auto report = co_await attempt_control.wait();
         record_attempt(state, request.parts, Some(status), report);
-        if (completion.result.is_ok() && report->logical.result.is_err())
-            completion.result = Err(report->logical.result.as_ref().unwrap_err().clone());
+        bool observed_attempt_failure =
+            cache_tap.is_some() && (*cache_tap)->fields.lock().unwrap()->attempt_failed &&
+            completion.result.is_err() && completion.result.as_ref().unwrap_err().is_Closed();
+        if (report->logical.result.is_err() &&
+            (completion.result.is_ok() || observed_attempt_failure)) {
+            auto original = attempt.take_error();
+            if (original.is_some()) {
+                completion.result     = Err(original.take().unwrap());
+                completion.diagnostic = None();
+            }
+        }
         co_return rstd::move(completion);
     }
 }
@@ -1113,16 +1122,21 @@ auto Client::execute(ExecutionRequest request, ExecuteOptions options) const
 void Client::request_close() const {
     stop_http_client(state_);
 }
-auto client_close_report(Arc<ClientState> state, coro<Result<empty>> closing) -> coro<CloseReport> {
+auto client_close_report(Arc<ClientState> state, coro<CleanupReport> closing)
+    -> coro<CleanupReport> {
     auto closed = co_await rstd::move(closing);
-    auto f      = state->fields.lock().unwrap();
-    if (f->close_report.is_some()) co_return f->close_report->clone();
-    CloseReport report;
-    if (closed.is_err()) report.add(rstd::move(closed).unwrap_err());
+    auto report = co_await state->scope.close();
+    report.merge(rstd::move(closed));
     co_return rstd::move(report);
 }
-auto Client::close() const -> coro<CloseReport> {
+auto Client::close() const -> coro<CleanupReport> {
     request_close();
-    return client_close_report(state_.clone(), registration_->release());
+    return client_close_report(state_.clone(), registration_->wait_released());
+}
+auto Client::take_close_errors() -> Vec<Error> {
+    auto errors = state_->scope.take_close_errors();
+    auto result = registration_->take_release_result();
+    if (result && result->is_err()) errors.push(rstd::move(*result).unwrap_err());
+    return errors;
 }
 } // namespace lifetchto::http

@@ -19,13 +19,17 @@ auto read_body(Arc<BodyState> state) -> coro<Result<Option<Bytes>>> {
     Option<ByteQueue> queue;
     {
         auto f = state->fields.lock().unwrap();
-        if (f->error.is_some()) co_return Err(f->error->clone());
+        if (f->error.is_some()) co_return Err(f->error.take().unwrap());
+        if (f->failed) co_return Err(Error::Closed());
         if (f->canceled) co_return Err(Error::Canceled());
         if (f->consumed) co_return Ok(None());
         queue = Some(f->queue->clone());
     }
     auto part = co_await queue->next();
-    if (part.is_err()) state->fail(part.as_ref().unwrap_err().clone());
+    if (part.is_err()) {
+        auto f = state->fields.lock().unwrap();
+        if (f->error.is_some()) part = Err(f->error.take().unwrap());
+    }
     if (part.is_ok() && part->is_none()) {
         auto f      = state->fields.lock().unwrap();
         f->consumed = true;
@@ -39,19 +43,25 @@ auto wait_body_release(Arc<BodyState> state) -> coro<Result<empty>> {
         {
             auto f = state->fields.lock().unwrap();
             if (f->released) {
-                if (f->cleanup_error.is_some()) co_return Err(f->cleanup_error->clone());
                 co_return Ok(empty {});
             }
         }
         co_await rstd::move(event);
     }
 }
+auto take_body_cleanup(const Arc<BodyState>& state) -> Result<empty> {
+    auto f = state->fields.lock().unwrap();
+    if (! f->released || f->cleanup_taken)
+        return Err(Error::Contract("body cleanup result unavailable"_Str));
+    f->cleanup_taken = true;
+    return collect_errors(rstd::exchange(f->cleanup_errors, Vec<Error> {}));
+}
 struct NativeResponseSource {
     Arc<BodyState> state;
     auto           next() const -> coro<Result<Option<Bytes>>> { return read_body(state.clone()); }
     auto           trailers() const -> Result<Option<lihttpto::Headers>> {
         auto f = state->fields.lock().unwrap();
-        if (f->error.is_some()) return Err(f->error->clone());
+        if (f->failed) return Err(Error::Closed());
         if (! f->consumed) return Ok(None());
         return Ok(f->trailers.clone());
     }

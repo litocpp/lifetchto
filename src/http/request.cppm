@@ -25,6 +25,10 @@ public:
     auto next(usize window) -> coro<Result<Option<Bytes>>> { return content_.next(window); }
     void cancel() const { content_.cancel(); }
     auto close() const -> coro<Result<rstd::empty>> { return content_.close(); }
+    auto wait_closed() const -> coro<CleanupReport> { return content_.wait_closed(); }
+    auto take_close_result() const -> Option<Result<rstd::empty>> {
+        return content_.take_close_result();
+    }
 };
 class UploadPlan {
     lifetchto::UploadPlan     content_;
@@ -57,6 +61,10 @@ public:
     auto open(TransferContext context) const -> coro<Result<UploadBody>>;
     void request_close() const { content_.request_close(); }
     auto close() const -> coro<Result<rstd::empty>> { return content_.close(); }
+    auto wait_closed() const -> coro<CleanupReport> { return content_.wait_closed(); }
+    auto take_close_result() const -> Option<Result<rstd::empty>> {
+        return content_.take_close_result();
+    }
 };
 using ExecutionRequest = lihttpto::RequestMessage<UploadPlan>;
 } // namespace lifetchto::http

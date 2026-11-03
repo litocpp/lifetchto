@@ -284,7 +284,9 @@ TEST(TransferCore, DeadlineAfterDuplexOutputClosesLeaseWithoutFinishing) {
                 .unwrap();
         auto endpoint = (co_await transfer.output()).unwrap();
         auto report   = co_await transfer.control().wait();
-        EXPECT_TRUE(report->logical.result.as_ref().unwrap_err().is_Timeout());
+        EXPECT_EQ(report->logical.result.as_ref().unwrap_err().message.as_str(),
+                  "transfer deadline expired"_str);
+        EXPECT_TRUE(transfer.take_error().unwrap().is_Timeout());
         EXPECT_EQ(report->logical.remote, lf::RemoteOutcome::Unknown);
         EXPECT_EQ(report->stop_requested, Some(lf::StopReason::Deadline));
         EXPECT_TRUE((co_await endpoint.next()).is_err());

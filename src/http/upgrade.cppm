@@ -60,6 +60,9 @@ public:
     auto completion() const -> TransferControl;
     void cancel() const;
     auto close() const -> coro<Arc<TransferReport>>;
+    auto take_error() const -> Option<Error>;
+    auto take_write_error() const -> Option<Error>;
+    auto take_cleanup_errors() const -> Vec<Error>;
 };
 struct PendingUpgradeState;
 class PendingUpgrade {
