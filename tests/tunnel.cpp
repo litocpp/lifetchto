@@ -155,9 +155,11 @@ auto tunnel_options() -> http::TransportOptions {
 }
 auto tunnel_client(Engine&                                    engine,
                    Duration                                   timeout = Duration::from_secs(u64(2)),
-                   const char*                                port_name = "LIFETCHTO_H2_PORT",
-                   Option<Arc<rstd::dyn<http::TcpConnector>>> connector = {},
-                   Option<usize> stream_limit = {}) -> http::TunnelClient {
+                   const char*                                port_name      = "LIFETCHTO_H2_PORT",
+                   Option<Arc<rstd::dyn<http::TcpConnector>>> connector      = {},
+                   Option<usize>                              stream_limit   = {},
+                   Option<usize>                              receive_window = {},
+                   Option<usize> upload_window = {}) -> http::TunnelClient {
     auto port = u16(::atoi(::getenv(port_name)));
     auto url =
         lihttpto::Url::parse_http(rstd::format("https://origin.test:{}/", port).as_str()).unwrap();
@@ -168,6 +170,8 @@ auto tunnel_client(Engine&                                    engine,
     auto              options = tunnel_options();
     options.connect_timeout   = timeout;
     if (stream_limit.is_some()) options.max_http2_streams = *stream_limit;
+    if (receive_window.is_some()) options.receive_window = *receive_window;
+    if (upload_window.is_some()) options.upload_window = *upload_window;
     return http::TunnelClient::make(
                engine.resources(), rstd::move(url), rstd::move(route), rstd::move(options))
         .unwrap();
@@ -201,6 +205,15 @@ auto tunnel_receive(rstd::async::io::Stream& stream, usize count) -> coro<Bytes>
         bytes.extend_from_slice(part.as_slice());
     }
     co_return Bytes::from_vec(rstd::move(bytes));
+}
+auto tunnel_line(rstd::async::io::Stream& stream) -> coro<String> {
+    String line;
+    for (;;) {
+        auto byte = (co_await stream.recv(usize(1))).unwrap();
+        if (byte.is_empty() || byte.as_slice() == "\n"_bytes) break;
+        line.push_str(rstd::str_::from_utf8(byte.as_slice()).unwrap());
+    }
+    co_return line;
 }
 auto tunnel_close_twice(rstd::async::io::Stream& stream) -> coro<empty> {
     for (unsigned count = 0; count < 2; ++count) {
@@ -375,6 +388,97 @@ TEST(H2Tunnel, ReceiveOverwritesNonemptyBufferAndReusesStorage) {
     runtime.block_on(run());
 }
 
+TEST(H2Tunnel, LargeReceiveWindowKeepsUploadAndConcurrentBudgetIndependent) {
+    if (! ::getenv("LIFETCHTO_H2_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        auto                     engine = Engine::make(runtime.handle()).unwrap();
+        auto                     client = tunnel_client(engine,
+                                                        Duration::from_secs(u64(2)),
+                                                        "LIFETCHTO_H2_PORT",
+                                                        {},
+                                                        Some(usize(64)),
+                                                        Some(usize(512 * 1024)),
+                                                        Some(usize(64 * 1024)));
+        Vec<http::PendingTunnel> pending;
+        for (usize i; i < usize(64); ++i) pending.push(client.open("budget.test:443"_Str).unwrap());
+        Vec<rstd::async::io::Stream> streams;
+        Option<String>               identity;
+        for (auto& waiting : pending) {
+            auto connection = (co_await waiting.connected()).unwrap();
+            EXPECT_EQ(*connection.head().headers.get_unique_text("x-receive-window"_str).unwrap(),
+                      "524288"_str);
+            auto current = *connection.head().headers.get_unique_text("x-connection"_str).unwrap();
+            if (identity.is_none()) identity = Some(String::make(current));
+            EXPECT_EQ(current, identity->as_str());
+            streams.push(rstd::move(connection).into_stream());
+        }
+        EXPECT_LT(engine.resources().usage().bytes, usize(48 * 1024 * 1024));
+        Vec<u8> block;
+        block.resize(usize(128 * 1024), u8('u'));
+        auto payload = Bytes::from_vec(rstd::move(block));
+        EXPECT_EQ((co_await streams[usize()].send(payload.clone())).unwrap(), usize(64 * 1024));
+        auto echoed = co_await tunnel_receive(streams[usize()], usize(64 * 1024));
+        EXPECT_TRUE(echoed.as_slice() == payload.slice(usize(), usize(64 * 1024)).as_slice());
+        for (auto& stream : streams) EXPECT_TRUE((co_await stream.close()).is_ok());
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        EXPECT_EQ(engine.resources().usage().bytes, usize());
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
+
+TEST(H2Tunnel, SlowReaderWithholdsStreamCreditAndResumesFromItsReceiveWindow) {
+    if (! ::getenv("LIFETCHTO_H2_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        auto engine     = Engine::make(runtime.handle()).unwrap();
+        auto client     = tunnel_client(engine,
+                                        Duration::from_secs(u64(2)),
+                                        "LIFETCHTO_H2_PORT",
+                                        {},
+                                        Some(usize(64)),
+                                        Some(usize(512 * 1024)),
+                                        Some(usize(64 * 1024)));
+        auto pending    = client.open("window.test:443"_Str).unwrap();
+        auto control    = client.open("control.test:443"_Str).unwrap();
+        auto ready      = (co_await pending.connected()).unwrap();
+        auto controlled = (co_await control.connected()).unwrap();
+        auto stream     = rstd::move(ready).into_stream();
+        auto echo       = rstd::move(controlled).into_stream();
+        for (unsigned i = 0; i < 2; ++i) {
+            EXPECT_EQ(
+                (co_await echo.send_all(Bytes::copy_from_slice("window-status\n"_bytes))).unwrap(),
+                usize(14));
+            EXPECT_EQ((co_await tunnel_line(echo)).as_str(), "524288:0:0"_str);
+        }
+        auto first = (co_await stream.recv(usize(16384))).unwrap();
+        EXPECT_EQ(first.len(), usize(16384));
+        for (unsigned i = 0; i < 2; ++i) {
+            EXPECT_EQ(
+                (co_await echo.send_all(Bytes::copy_from_slice("window-status\n"_bytes))).unwrap(),
+                usize(14));
+            auto status = co_await tunnel_line(echo);
+            if (i == 1) EXPECT_EQ(status.as_str(), "540672:0:16384"_str);
+        }
+        auto tail = co_await tunnel_receive(stream, usize(512 * 1024 + 16384));
+        EXPECT_EQ(tail.len(), usize(512 * 1024 + 16384));
+        bool valid = true;
+        for (auto byte : first.as_slice()) valid &= byte == u8('w');
+        for (auto byte : tail.as_slice()) valid &= byte == u8('w');
+        EXPECT_TRUE(valid);
+        EXPECT_TRUE((co_await stream.recv()).unwrap().is_empty());
+        co_await tunnel_close_twice(stream);
+        co_await tunnel_close_twice(echo);
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        EXPECT_EQ(engine.resources().usage().bytes, usize());
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
+
 TEST(HttpConnectDiagnostic, ContextMovePreservesErrorVariants) {
     for (bool canceled : array<bool, 2> { false, true }) {
         auto cause   = canceled ? Error::Canceled() : Error::Timeout();
@@ -527,9 +631,14 @@ TEST(H2Tunnel, EndAndNoErrorResetInOneBatchDrainEveryBufferedFrameBeforeEof) {
     if (! ::getenv("LIFETCHTO_H2_PORT")) GTEST_SKIP();
     auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
     auto run     = [&]() -> coro<empty> {
-        auto engine = Engine::make(runtime.handle()).unwrap();
-        auto client = tunnel_client(
-            engine, Duration::from_secs(u64(2)), "LIFETCHTO_H2_PORT", {}, Some(usize(1)));
+        auto engine  = Engine::make(runtime.handle()).unwrap();
+        auto client  = tunnel_client(engine,
+                                     Duration::from_secs(u64(2)),
+                                     "LIFETCHTO_H2_PORT",
+                                     {},
+                                     Some(usize(1)),
+                                     Some(usize(512 * 1024)),
+                                     Some(usize(64 * 1024)));
         auto pending = client.open("clean-batch.test:443"_Str).unwrap();
         auto ready   = (co_await pending.connected()).unwrap();
         auto identity =

@@ -90,6 +90,9 @@ class Handler(socketserver.BaseRequestHandler):
             tunnel_terminal = set()
             tunnel_started = set()
             split_reset = None
+            window_target = None
+            window_sent = 0
+            window_credit = 0
             goaway = False
             close_mode = "notify"
             while True:
@@ -117,9 +120,14 @@ class Handler(socketserver.BaseRequestHandler):
                             else:
                                 tunnels.add(sid)
                                 conn.send_headers(sid, [(b":status", b"200"),
-                                    (b"x-connection", str(identity).encode()), (b"padding-type-reply", b"1")])
+                                    (b"x-connection", str(identity).encode()),
+                                    (b"x-receive-window", str(conn.remote_settings.initial_window_size).encode()),
+                                    (b"padding-type-reply", b"1")])
                                 if authority.startswith(b"half"):
                                     conn.send_data(sid, b"early", end_stream=True)
+                                elif authority.startswith(b"window"):
+                                    window_target = sid
+                                    pending[sid] = b"w" * (512 * 1024 + 32768)
                             continue
                         target = fields[b":path"].decode()
                         if target in ("/close-eof", "/close-stall"):
@@ -149,7 +157,15 @@ class Handler(socketserver.BaseRequestHandler):
                                         tunnel_terminal.add(split_reset)
                                         self.server.event(connection=identity,
                                                           clean_reset=split_reset, batch=False)
-                                    pending[sid] = pending.get(sid, b"") + command + b"\n"
+                                    if command == b"window-status":
+                                        if window_target is None:
+                                            raise AssertionError("missing receive window target")
+                                        response = (f"{window_sent}:"
+                                                    f"{conn.local_flow_control_window(window_target)}:"
+                                                    f"{window_credit}\n").encode()
+                                    else:
+                                        response = command + b"\n"
+                                    pending[sid] = pending.get(sid, b"") + response
                                 conn.acknowledge_received_data(event.flow_controlled_length, sid)
                                 continue
                             if authority.startswith(b"clean-partial"):
@@ -243,6 +259,8 @@ class Handler(socketserver.BaseRequestHandler):
                         pending.pop(event.stream_id, None)
                     elif isinstance(event, h2.events.WindowUpdated):
                         self.server.event(connection=identity, window=event.stream_id, credit=event.delta)
+                        if event.stream_id == window_target:
+                            window_credit += event.delta
                     elif isinstance(event, h2.events.ConnectionTerminated):
                         self.server.event(connection=identity, goaway=int(event.error_code))
                         if close_mode == "/close-eof":
@@ -264,8 +282,11 @@ class Handler(socketserver.BaseRequestHandler):
                         if count == 0 and body:
                             break
                         last = count == len(body)
-                        end = last and sid not in trailers and (sid not in tunnels or sid in tunnel_ended)
+                        end = last and sid not in trailers and (sid not in tunnels or
+                                                                sid in tunnel_ended or sid == window_target)
                         conn.send_data(sid, body[:count], end_stream=end)
+                        if sid == window_target:
+                            window_sent += count
                         if last:
                             pending.pop(sid)
                             if sid in trailers:
