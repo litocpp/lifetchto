@@ -17,6 +17,8 @@ enum class ConnectStage
     Tls,
     ProxyConnect,
     Http2Settings,
+    ConnectQueued,
+    ConnectWrite,
     ConnectHead,
     TunnelIo
 };
@@ -26,6 +28,8 @@ auto connect_stage_name(ConnectStage stage) -> ref<str> {
     case ConnectStage::Tls: return "tls"_str;
     case ConnectStage::ProxyConnect: return "proxy_connect"_str;
     case ConnectStage::Http2Settings: return "http2_settings"_str;
+    case ConnectStage::ConnectQueued: return "connect_queued"_str;
+    case ConnectStage::ConnectWrite: return "connect_write"_str;
     case ConnectStage::ConnectHead: return "connect_head"_str;
     case ConnectStage::TunnelIo: return "tunnel_io"_str;
     }

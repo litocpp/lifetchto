@@ -9,7 +9,8 @@ namespace tunnel_test
 {
 using lifetchto::Result;
 struct GateFields {
-    bool armed {}, blocked {}, released {}, stopped {};
+    bool  armed {}, blocked {}, released {}, stopped {};
+    usize minimum_bytes { 1024 };
 };
 struct Gate {
     rstd::sync::Mutex<GateFields> fields { GateFields {} };
@@ -32,8 +33,7 @@ auto gated_send(Arc<WireState> state, Bytes bytes) -> coro<rstd::io::Result<usiz
     bool hold;
     {
         auto f = state->gate->fields.lock().unwrap();
-        // Let small HTTP/2 control records pass while holding the upload completion.
-        hold = f->armed && ! f->stopped && size >= usize(1024);
+        hold   = f->armed && ! f->stopped && size >= f->minimum_bytes;
         if (hold) {
             f->armed   = false;
             f->blocked = true;
@@ -470,6 +470,226 @@ TEST(H2Tunnel, SlowReaderWithholdsStreamCreditAndResumesFromItsReceiveWindow) {
         EXPECT_TRUE(valid);
         EXPECT_TRUE((co_await stream.recv()).unwrap().is_empty());
         co_await tunnel_close_twice(stream);
+        co_await tunnel_close_twice(echo);
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        EXPECT_EQ(engine.resources().usage().bytes, usize());
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
+
+TEST(H2Tunnel, NewConnectHeadDoesNotWaitForEveryQueuedUpload) {
+    if (! ::getenv("LIFETCHTO_H2_MIXED_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        auto engine = Engine::make(runtime.handle()).unwrap();
+        auto gate   = Arc<tunnel_test::Gate>::make();
+        auto connector =
+            Arc<rstd::dyn<http::TcpConnector>>::make(tunnel_test::Connector { gate.clone() });
+        auto                     client = tunnel_client(engine,
+                                                        Duration::from_secs(u64(2)),
+                                                        "LIFETCHTO_H2_MIXED_PORT",
+                                                        Some(rstd::move(connector)),
+                                                        Some(usize(64)),
+                                                        Some(usize(512 * 1024)),
+                                                        Some(usize(64 * 1024)));
+        Vec<http::PendingTunnel> pending;
+        for (usize i; i < usize(8); ++i)
+            pending.push(client.open(rstd::format("bulk-{}.test:443", i)).unwrap());
+        Vec<rstd::async::io::Stream> streams;
+        Option<String>               identity;
+        for (auto& waiting : pending) {
+            auto connection = (co_await waiting.connected()).unwrap();
+            auto current = *connection.head().headers.get_unique_text("x-connection"_str).unwrap();
+            if (identity.is_none()) identity = Some(String::make(current));
+            EXPECT_EQ(current, identity->as_str());
+            streams.push(rstd::move(connection).into_stream());
+        }
+        Vec<u8> block;
+        block.resize(usize(64 * 1024), u8('b'));
+        auto                                       payload = Bytes::from_vec(rstd::move(block));
+        Vec<coro<rstd::io::Result<usize>>::Future> writing;
+        auto cx                             = rstd::task::Context { rstd::task::Waker::noop() };
+        gate->fields.lock().unwrap()->armed = true;
+        for (auto& stream : streams) {
+            auto operation = stream.send(payload.clone()).into_future();
+            EXPECT_TRUE(rstd::future::poll(operation, cx).is_pending());
+            writing.push(rstd::move(operation));
+        }
+        for (;;) {
+            auto event = gate->changed.listen();
+            if (gate->fields.lock().unwrap()->blocked) break;
+            co_await rstd::move(event);
+        }
+        auto urgent   = client.open("control-urgent.test:443"_Str).unwrap();
+        auto deadline = rstd::time::Instant::now() + Duration::from_secs(u64(2));
+        while (urgent.progress().stream_id == u32() && rstd::time::Instant::now() < deadline)
+            co_await rstd::async::yield_now();
+        EXPECT_TRUE(urgent.progress().stream_id != u32());
+        EXPECT_EQ(urgent.progress().stage, http::ConnectStage::ConnectQueued);
+        gate->release();
+        auto connected = (co_await urgent.connected()).unwrap();
+        EXPECT_EQ(*connected.head().headers.get_unique_text("x-connection"_str).unwrap(),
+                  identity->as_str());
+        auto before =
+            rstd::from_str<usize>(
+                *connected.head().headers.get_unique_text("x-bulk-before-head"_str).unwrap())
+                .unwrap();
+        // One native batch may already be in flight when the new head is admitted.
+        EXPECT_LE(before, usize(64 * 1024));
+        auto control = rstd::move(connected).into_stream();
+        for (auto& operation : writing)
+            EXPECT_EQ((co_await rstd::future::by_ref(operation)).unwrap(), payload.len());
+        EXPECT_TRUE(
+            (co_await control.send_all(Bytes::copy_from_slice("bulk-status\n"_bytes))).is_ok());
+        EXPECT_EQ((co_await tunnel_line(control)).as_str(), "524288"_str);
+        for (auto& stream : streams) EXPECT_TRUE((co_await stream.close()).is_ok());
+        co_await tunnel_close_twice(control);
+        EXPECT_FALSE(gate->fields.lock().unwrap()->stopped);
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        EXPECT_EQ(engine.resources().usage().bytes, usize());
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
+
+TEST(H2Tunnel, ConnectProgressWaitsForTheNativeHeaderCompletion) {
+    if (! ::getenv("LIFETCHTO_H2_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        auto engine = Engine::make(runtime.handle()).unwrap();
+        auto gate   = Arc<tunnel_test::Gate>::make();
+        auto connector =
+            Arc<rstd::dyn<http::TcpConnector>>::make(tunnel_test::Connector { gate.clone() });
+        auto client = tunnel_client(
+            engine, Duration::from_secs(u64(2)), "LIFETCHTO_H2_PORT", Some(rstd::move(connector)));
+        auto warm_pending = client.open("control-warm.test:443"_Str).unwrap();
+        auto warm_ready   = (co_await warm_pending.connected()).unwrap();
+        auto identity =
+            String::make(*warm_ready.head().headers.get_unique_text("x-connection"_str).unwrap());
+        auto warm = rstd::move(warm_ready).into_stream();
+        EXPECT_TRUE((co_await warm.send_all(Bytes::copy_from_slice("ready\n"_bytes))).is_ok());
+        EXPECT_EQ((co_await tunnel_line(warm)).as_str(), "ready"_str);
+        EXPECT_TRUE((co_await warm.close()).is_ok());
+        {
+            auto fields           = gate->fields.lock().unwrap();
+            fields->minimum_bytes = usize(1);
+            fields->armed         = true;
+        }
+        auto waiting = client.open("stall-write.test:443"_Str).unwrap();
+        for (;;) {
+            auto event = gate->changed.listen();
+            if (gate->fields.lock().unwrap()->blocked) break;
+            co_await rstd::move(event);
+        }
+        auto writing = waiting.progress();
+        EXPECT_TRUE(writing.stream_id != u32());
+        EXPECT_EQ(writing.session_id, warm_pending.progress().session_id);
+        EXPECT_EQ(writing.stage, http::ConnectStage::ConnectWrite);
+        gate->release();
+        auto deadline = rstd::time::Instant::now() + Duration::from_secs(u64(2));
+        while (waiting.progress().stage == http::ConnectStage::ConnectWrite &&
+               rstd::time::Instant::now() < deadline)
+            co_await rstd::async::yield_now();
+        EXPECT_EQ(waiting.progress().stage, http::ConnectStage::ConnectHead);
+        waiting.request_stop();
+        EXPECT_TRUE((co_await waiting.close()).is_ok());
+        EXPECT_TRUE((co_await waiting.connected()).is_err());
+        EXPECT_FALSE(gate->fields.lock().unwrap()->stopped);
+        auto sibling = client.open("control-after-write.test:443"_Str).unwrap();
+        auto ready   = (co_await sibling.connected()).unwrap();
+        EXPECT_EQ(*ready.head().headers.get_unique_text("x-connection"_str).unwrap(),
+                  identity.as_str());
+        auto echo = rstd::move(ready).into_stream();
+        EXPECT_TRUE((co_await echo.close()).is_ok());
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        EXPECT_EQ(engine.resources().usage().bytes, usize());
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
+
+TEST(H2Tunnel, ConnectAndCancelRemainIndependentOfBlockedUploadAndUnreadDownload) {
+    if (! ::getenv("LIFETCHTO_H2_MIXED_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        auto engine          = Engine::make(runtime.handle()).unwrap();
+        auto client          = tunnel_client(engine,
+                                             Duration::from_secs(u64(2)),
+                                             "LIFETCHTO_H2_MIXED_PORT",
+                                             {},
+                                             Some(usize(64)),
+                                             Some(usize(512 * 1024)),
+                                             Some(usize(128 * 1024)));
+        auto up_pending      = client.open("hold-upload.test:443"_Str).unwrap();
+        auto down_pending    = client.open("window-mixed.test:443"_Str).unwrap();
+        auto control_pending = client.open("control-mixed.test:443"_Str).unwrap();
+        auto up_ready        = (co_await up_pending.connected()).unwrap();
+        auto down_ready      = (co_await down_pending.connected()).unwrap();
+        auto control_ready   = (co_await control_pending.connected()).unwrap();
+        auto identity =
+            String::make(*up_ready.head().headers.get_unique_text("x-connection"_str).unwrap());
+        EXPECT_EQ(*down_ready.head().headers.get_unique_text("x-connection"_str).unwrap(),
+                  identity.as_str());
+        EXPECT_EQ(*control_ready.head().headers.get_unique_text("x-connection"_str).unwrap(),
+                  identity.as_str());
+        auto upload   = rstd::move(up_ready).into_stream();
+        auto download = rstd::move(down_ready).into_stream();
+        auto control  = rstd::move(control_ready).into_stream();
+        for (unsigned i = 0; i < 2; ++i) {
+            EXPECT_TRUE((co_await control.send_all(Bytes::copy_from_slice("mixed-status\n"_bytes)))
+                            .is_ok());
+            EXPECT_EQ((co_await tunnel_line(control)).as_str(), "524288:0:0:0"_str);
+        }
+        Vec<u8> block;
+        block.resize(usize(128 * 1024), u8('h'));
+        auto writing = upload.send(Bytes::from_vec(rstd::move(block))).into_future();
+        auto cx      = rstd::task::Context { rstd::task::Waker::noop() };
+        EXPECT_TRUE(rstd::future::poll(writing, cx).is_pending());
+        String status;
+        auto   deadline = rstd::time::Instant::now() + Duration::from_secs(u64(2));
+        do {
+            EXPECT_TRUE((co_await control.send_all(Bytes::copy_from_slice("mixed-status\n"_bytes)))
+                            .is_ok());
+            status = co_await tunnel_line(control);
+        } while (status.as_str() != "524288:0:65536:0"_str &&
+                 rstd::time::Instant::now() < deadline);
+        EXPECT_EQ(status.as_str(), "524288:0:65536:0"_str);
+        EXPECT_TRUE(rstd::future::poll(writing, cx).is_pending());
+        auto late       = client.open("control-late.test:443"_Str).unwrap();
+        auto late_ready = (co_await late.connected()).unwrap();
+        EXPECT_EQ(*late_ready.head().headers.get_unique_text("x-connection"_str).unwrap(),
+                  identity.as_str());
+        auto echo = rstd::move(late_ready).into_stream();
+        EXPECT_TRUE((co_await echo.send_all(Bytes::copy_from_slice("alive\n"_bytes))).is_ok());
+        EXPECT_EQ((co_await tunnel_line(echo)).as_str(), "alive"_str);
+        upload.request_stop();
+        EXPECT_TRUE((co_await upload.close()).is_ok());
+        EXPECT_EQ((co_await rstd::future::by_ref(writing)).unwrap(), usize(65536));
+        EXPECT_TRUE((co_await upload.send(Bytes::copy_from_slice("refused"_bytes))).is_err());
+        EXPECT_TRUE(
+            (co_await echo.send_all(Bytes::copy_from_slice("mixed-status\n"_bytes))).is_ok());
+        EXPECT_EQ((co_await tunnel_line(echo)).as_str(), "524288:0:65536:1"_str);
+        auto first = (co_await download.recv(usize(16384))).unwrap();
+        EXPECT_EQ(first.len(), usize(16384));
+        for (unsigned i = 0; i < 2; ++i) {
+            EXPECT_TRUE((co_await control.send_all(Bytes::copy_from_slice("window-status\n"_bytes)))
+                            .is_ok());
+            auto current = co_await tunnel_line(control);
+            if (i == 1) EXPECT_EQ(current.as_str(), "540672:0:16384"_str);
+        }
+        auto tail = co_await tunnel_receive(download, usize(512 * 1024 + 16384));
+        EXPECT_EQ(tail.len(), usize(512 * 1024 + 16384));
+        bool valid = true;
+        for (auto byte : first.as_slice()) valid &= byte == u8('w');
+        for (auto byte : tail.as_slice()) valid &= byte == u8('w');
+        EXPECT_TRUE(valid);
+        EXPECT_TRUE((co_await download.recv()).unwrap().is_empty());
+        co_await tunnel_close_twice(download);
+        co_await tunnel_close_twice(control);
         co_await tunnel_close_twice(echo);
         EXPECT_TRUE((co_await client.close()).is_ok());
         EXPECT_TRUE((co_await engine.close()).is_ok());

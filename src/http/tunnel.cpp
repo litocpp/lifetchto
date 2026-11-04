@@ -59,6 +59,16 @@ struct TunnelStreamState {
           connection(rstd::move(connection)) {
         fields.lock().unwrap()->permit = Some(rstd::move(permit));
     }
+    auto connect_stage(Option<ConnectStage> stage) const -> ConnectStage {
+        auto shared = connection->connect_stage();
+        switch (shared) {
+        case ConnectStage::Dial:
+        case ConnectStage::Tls:
+        case ConnectStage::ProxyConnect:
+        case ConnectStage::Http2Settings: return shared;
+        default: return stage.unwrap_or(shared);
+        }
+    }
     auto progress() const -> ConnectProgress {
         Option<ConnectStage> stage;
         u32                  stream;
@@ -67,7 +77,7 @@ struct TunnelStreamState {
             stage  = f->stage;
             stream = f->stream_id;
         }
-        return { stage.unwrap_or(connection->connect_stage()), session_id, stream };
+        return { connect_stage(stage), session_id, stream };
     }
     void notify() const {
         changed.notify();
@@ -427,6 +437,7 @@ struct TunnelWake {
     TunnelIo*           io;
     EventWait           changed;
     Option<TunnelTimer> timer;
+    bool                immediate {};
     using Output = empty;
     auto poll(mut_ref<TunnelWake> self, rstd::task::Context& cx) -> rstd::task::Poll<empty> {
         bool ready = false;
@@ -448,14 +459,19 @@ struct TunnelWake {
         }
         if (rstd::future::poll(self->changed, cx).is_ready()) ready = true;
         if (self->timer.is_some() && rstd::future::poll(*self->timer, cx).is_ready()) ready = true;
-        return ready ? rstd::task::Poll<empty>::Ready(empty {})
-                     : rstd::task::Poll<empty>::Pending();
+        return ready || self->immediate ? rstd::task::Poll<empty>::Ready(empty {})
+                                        : rstd::task::Poll<empty>::Pending();
     }
 };
 struct TunnelWire {
     lihttpto::h2::Outbound output;
     u64                    serial;
     usize                  offset {};
+};
+struct TunnelBatch {
+    Bytes bytes;
+    usize frames {}, offset {};
+    bool  copied {};
 };
 auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty>;
 struct TunnelTask {
@@ -524,9 +540,13 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
     if (created.is_ok()) protocol = Some(rstd::move(created).unwrap());
     TunnelIo                    io;
     Vec<TunnelWire>             outgoing;
-    Option<TunnelWire>          current;
+    Option<TunnelBatch>         current;
+    rstd::bytes::BytesMut       batch_buffer;
     Vec<Arc<TunnelStreamState>> streams;
     u64                         scheduled {}, completed {};
+    Option<u64>                 pending_data;
+    usize                       next_upload {}, turns {};
+    constexpr usize             batch_limit { 64 * 1024 };
     auto settings_deadline = Instant::now() + pool->native->options.connect_timeout;
     auto idle_deadline     = Instant::now() + pool->native->options.idle_timeout;
     auto find              = [&](u32 id) -> TunnelStreamState* {
@@ -545,6 +565,10 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
         }
     };
     while (fatal.is_none()) {
+        if (++turns == usize(64)) {
+            turns = usize();
+            co_await rstd::async::yield_now();
+        }
         auto event    = owner->changed.listen();
         bool progress = false, closing;
         auto now      = Instant::now();
@@ -574,27 +598,50 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
                 fatal = Some(rstd::move(result).unwrap_err());
                 break;
             }
-            if (*result == usize() || *result > current->output.bytes.len() - current->offset) {
+            if (current.is_none() || *result == usize() ||
+                *result > current->bytes.len() - current->offset) {
                 fatal = Some(Error::Contract("invalid tunnel write completion"_Str));
                 break;
             }
-            auto& wire  = *current;
-            auto  begin = rstd::cmp::max(wire.offset, wire.output.payload_offset);
-            auto  end   = rstd::cmp::min(wire.offset + *result,
-                                         wire.output.payload_offset + wire.output.payload_length);
-            if (end > begin)
+            auto remaining = *result;
+            while (remaining != usize()) {
+                auto& wire  = outgoing[usize()];
+                auto  count = rstd::min(remaining, wire.output.bytes.len() - wire.offset);
+                auto  begin = rstd::cmp::max(wire.offset, wire.output.payload_offset);
+                auto  end   = rstd::min(wire.offset + count,
+                                        wire.output.payload_offset + wire.output.payload_length);
                 if (auto* stream = find(wire.output.stream)) {
                     auto f = stream->fields.lock().unwrap();
-                    if (f->write.is_some()) {
+                    if (end > begin && f->write.is_some()) {
                         f->write->confirmed += end - begin;
                         f->write->done = f->write->confirmed == f->write->bytes.len();
                     }
+                    if (wire.offset + count == wire.output.bytes.len()) {
+                        if (wire.output.headers_end && f->head.is_none() && ! f->transferred &&
+                            ! f->failed)
+                            f->stage = Some(ConnectStage::ConnectHead);
+                        if (wire.output.stream_end) f->shutdown_done = true;
+                    }
                     stream->changed.notify();
                 }
-            wire.offset += *result;
-            if (wire.offset == wire.output.bytes.len()) {
-                completed = wire.serial;
-                current   = None();
+                wire.offset += count;
+                remaining -= count;
+                if (wire.offset == wire.output.bytes.len()) {
+                    completed = wire.serial;
+                    outgoing.remove(usize());
+                    --current->frames;
+                }
+            }
+            current->offset += *result;
+            if (current->offset == current->bytes.len()) {
+                if (current->copied) {
+                    auto reclaimed = rstd::move(current->bytes).try_into_mut();
+                    if (reclaimed.is_ok()) {
+                        batch_buffer = rstd::move(reclaimed).unwrap();
+                        batch_buffer.clear();
+                    }
+                }
+                current = None();
             }
         }
         if (io.received.is_some()) {
@@ -616,14 +663,23 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
         }
         if (protocol->established() &&
             owner->connecting->connect_stage() == ConnectStage::Http2Settings)
-            owner->connecting->set_connect_stage(ConnectStage::ConnectHead);
+            owner->connecting->set_connect_stage(ConnectStage::ConnectQueued);
         auto events = protocol->take_events();
         for (auto& item : events) {
             progress = true;
             RSTD_MATCH(item) {
                 RSTD_CASE(Head, stream, head, informational) {
                     auto* s = find(stream);
-                    if (! s || informational) break;
+                    if (! s) break;
+                    {
+                        auto f = s->fields.lock().unwrap();
+                        if (f->head.is_none() && ! f->transferred && ! f->failed)
+                            f->stage = Some(ConnectStage::ConnectHead);
+                    }
+                    if (informational) {
+                        s->changed.notify();
+                        break;
+                    }
                     auto code = head.status.value();
                     if (code < u16(200) || code >= u16(300)) {
                         ProxyConnectFailure failure { rstd::move(head) };
@@ -714,7 +770,7 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
                 auto f = s->fields.lock().unwrap();
                 if (f->head.is_none() && ! f->transferred && f->error.is_none()) {
                     if (now >= s->deadline) {
-                        auto stage  = f->stage.unwrap_or(owner->connecting->connect_stage());
+                        auto stage  = s->connect_stage(f->stage);
                         f->error    = Some(connect_failure(
                             Error::Timeout(), ConnectProgress { stage, owner->id, s->id }));
                         f->stage    = Some(stage);
@@ -747,46 +803,10 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
                     {
                         auto f       = s->fields.lock().unwrap();
                         f->stream_id = s->id;
+                        f->stage     = Some(ConnectStage::ConnectQueued);
                     }
                     s->request = {};
                     progress   = true;
-                }
-            }
-            if (! stopping && s->id != u32()) {
-                auto f = s->fields.lock().unwrap();
-                if (f->head.is_some() || f->transferred) {
-                    if (f->write.is_some() && ! f->write->done && ! f->local_end) {
-                        auto& write = *f->write;
-                        auto  count =
-                            rstd::min(write.bytes.len() - write.queued, protocol->writable(s->id));
-                        if (count != usize()) {
-                            auto sent = protocol->send(
-                                s->id, write.bytes.slice(write.queued, write.queued + count));
-                            if (sent.is_err()) {
-                                f->error    = Some(connect_failure(
-                                    http2_error(rstd::move(sent).unwrap_err()),
-                                    ConnectProgress { ConnectStage::TunnelIo, owner->id, s->id }));
-                                f->stopping = true;
-                                f->failed   = true;
-                            } else {
-                                write.queued += count;
-                                progress = true;
-                            }
-                        }
-                    }
-                    if (f->shutdown_requested && ! f->local_end && f->write.is_none()) {
-                        auto sent = protocol->send(s->id, Bytes {}, true);
-                        if (sent.is_err()) {
-                            f->error    = Some(connect_failure(
-                                http2_error(rstd::move(sent).unwrap_err()),
-                                ConnectProgress { ConnectStage::TunnelIo, owner->id, s->id }));
-                            f->stopping = true;
-                            f->failed   = true;
-                        } else {
-                            f->local_end = true;
-                            progress     = true;
-                        }
-                    }
                 }
             }
             if (s->stop_deadline.is_some()) {
@@ -803,12 +823,8 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
             bool done;
             {
                 auto f = s->fields.lock().unwrap();
-                if (f->local_end && completed >= s->last_serial) {
-                    f->shutdown_done = true;
-                    s->changed.notify();
-                }
-                done = (s->reset || (f->local_end && f->remote_end && f->buffered == usize())) &&
-                       completed >= s->last_serial;
+                done   = (s->reset || (f->local_end && f->remote_end && f->buffered == usize())) &&
+                         completed >= s->last_serial;
                 if (done) {
                     f->released = true;
                     if (! f->graceful_reset || f->stopping) {
@@ -848,19 +864,91 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
             wake(idle_deadline);
         } else
             idle_deadline = now + pool->native->options.idle_timeout;
-        if (current.is_none() && ! outgoing.is_empty()) current = Some(outgoing.remove(usize()));
+        if (current.is_none() && io.write.is_none()) {
+            // Admit one DATA frame only when the previous native batch is confirmed.
+            if (pending_data.is_some() && completed >= *pending_data) pending_data = None();
+            bool admitted = false;
+            for (usize checked; pending_data.is_none() && checked < streams.len(); ++checked) {
+                next_upload %= streams.len();
+                auto s      = streams[next_upload].clone();
+                next_upload = (next_upload + usize(1)) % streams.len();
+                auto f      = s->fields.lock().unwrap();
+                if (f->stopping || f->local_end || (f->head.is_none() && ! f->transferred))
+                    continue;
+                Bytes bytes;
+                usize count;
+                bool  ending = f->shutdown_requested && f->write.is_none();
+                if (f->write.is_some() && ! f->write->done) {
+                    auto& write = *f->write;
+                    count = rstd::min(write.bytes.len() - write.queued, protocol->writable(s->id));
+                    if (count != usize())
+                        bytes = write.bytes.slice(write.queued, write.queued + count);
+                }
+                if (count == usize() && ! ending) continue;
+                auto sent = protocol->send(s->id, rstd::move(bytes), ending);
+                if (sent.is_err()) {
+                    f->error    = Some(connect_failure(
+                        http2_error(rstd::move(sent).unwrap_err()),
+                        ConnectProgress { ConnectStage::TunnelIo, owner->id, s->id }));
+                    f->stopping = true;
+                    f->failed   = true;
+                    s->changed.notify();
+                } else {
+                    admitted = true;
+                    if (ending)
+                        f->local_end = true;
+                    else
+                        f->write->queued += count;
+                }
+                progress = true;
+                break;
+            }
+            queue();
+            if (admitted) pending_data = Some(scheduled);
+            if (! outgoing.is_empty()) {
+                TunnelBatch batch;
+                if (outgoing[usize()].output.bytes.len() > batch_limit) {
+                    batch.bytes  = outgoing[usize()].output.bytes.clone();
+                    batch.frames = usize(1);
+                } else {
+                    if (batch_buffer.capacity() < batch_limit) {
+                        auto allocated = rstd::bytes::BytesMut::try_with_capacity(batch_limit);
+                        if (allocated.is_err()) {
+                            fatal = Some(Error::Capacity());
+                            break;
+                        }
+                        batch_buffer = rstd::move(allocated).unwrap();
+                    }
+                    while (batch.frames < outgoing.len() &&
+                           outgoing[batch.frames].output.bytes.len() <=
+                               batch_limit - batch_buffer.len()) {
+                        batch_buffer.put_slice(outgoing[batch.frames].output.bytes.as_slice());
+                        ++batch.frames;
+                    }
+                    batch.bytes  = batch_buffer.freeze();
+                    batch.copied = true;
+                }
+                for (usize i; i < batch.frames; ++i)
+                    if (outgoing[i].output.headers_start)
+                        if (auto* s = find(outgoing[i].output.stream)) {
+                            auto f = s->fields.lock().unwrap();
+                            if (f->head.is_none() && ! f->transferred && ! f->failed)
+                                f->stage = Some(ConnectStage::ConnectWrite);
+                        }
+                current = Some(rstd::move(batch));
+            }
+        }
         if (io.write.is_none() && current.is_some())
-            io.write = Some(native
-                                ->send_confirmed(current->output.bytes.slice(
-                                    current->offset, current->output.bytes.len()))
-                                .into_future());
+            io.write = Some(
+                native->send_confirmed(current->bytes.slice(current->offset, current->bytes.len()))
+                    .into_future());
         if (io.read.is_none()) io.read = Some(native->recv(usize(16384)).into_future());
-        if (progress) continue;
         co_await TunnelWake { &io,
                               rstd::move(event),
                               wake_at.is_some() ? Some(rstd::async::into_future(
                                                       rstd::async::sleep(remaining(*wake_at))))
-                                                : None<TunnelTimer>() };
+                                                : None<TunnelTimer>(),
+                              progress };
     }
     {
         auto f     = owner->fields.lock().unwrap();
@@ -869,7 +957,8 @@ auto tunnel_driver(Arc<TunnelPool> pool, Arc<TunnelSession> owner) -> coro<empty
     io.read  = None();
     io.write = None();
     outgoing.clear();
-    current = None();
+    current      = None();
+    batch_buffer = {};
     Option<Error> cleanup;
     if (native.is_some()) {
         auto closed = co_await native->close();
@@ -1089,7 +1178,8 @@ auto TunnelClient::open(String authority, Vec<lihttpto::h2::Field> fields) const
         if (active >= rstd::min(pool_->native->options.max_connections,
                                 pool_->native->options.max_connections_per_origin))
             return Err(Error::Busy());
-        auto permit = pool_->resources.try_reserve(ResourceAmount { .resources = usize(1) });
+        auto permit = pool_->resources.try_reserve(
+            ResourceAmount { .resources = usize(1), .bytes = usize(64 * 1024) });
         if (permit.is_err()) return Err(rstd::move(permit).unwrap_err());
         if (f->next_session_id == u64::MAX) return Err(Error::Capacity());
         auto session = Arc<TunnelSession>::make(

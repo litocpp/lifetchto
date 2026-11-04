@@ -23,12 +23,13 @@ class Peer(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
     def __init__(self, context, bad_settings=False, stall_tls=False, stall_settings=False,
-                 stream_window=None):
+                 stream_window=None, mixed=False):
         self.context = context
         self.bad_settings = bad_settings
         self.stall_tls = stall_tls
         self.stall_settings = stall_settings
         self.stream_window = stream_window
+        self.mixed = mixed
         self.events = []
         self.lock = threading.Lock()
         self.sequence = 0
@@ -73,6 +74,8 @@ class Handler(socketserver.BaseRequestHandler):
             if self.server.stream_window is not None:
                 conn.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE:
                                       self.server.stream_window})
+            if self.server.mixed:
+                conn.increment_flow_control_window(1024 * 1024 - 65535)
             initial = conn.data_to_send()
             if self.server.bad_settings:
                 initial = bytes.fromhex("000006040000000000000200000001")
@@ -93,6 +96,10 @@ class Handler(socketserver.BaseRequestHandler):
             window_target = None
             window_sent = 0
             window_credit = 0
+            bulk_received = 0
+            held_stream = None
+            held_received = 0
+            held_resets = 0
             goaway = False
             close_mode = "notify"
             while True:
@@ -119,10 +126,17 @@ class Handler(socketserver.BaseRequestHandler):
                                 conn.send_headers(sid, [(b":status", b"407")], end_stream=True)
                             else:
                                 tunnels.add(sid)
-                                conn.send_headers(sid, [(b":status", b"200"),
+                                response_headers = [(b":status", b"200"),
                                     (b"x-connection", str(identity).encode()),
                                     (b"x-receive-window", str(conn.remote_settings.initial_window_size).encode()),
-                                    (b"padding-type-reply", b"1")])
+                                    (b"padding-type-reply", b"1")]
+                                if self.server.mixed and authority.startswith(b"control-urgent"):
+                                    response_headers.append((b"x-bulk-before-head", str(bulk_received).encode()))
+                                    self.server.event(connection=identity, stream=sid,
+                                                      bulk_before_head=bulk_received)
+                                conn.send_headers(sid, response_headers)
+                                if self.server.mixed and authority.startswith(b"hold-upload"):
+                                    held_stream = sid
                                 if authority.startswith(b"half"):
                                     conn.send_data(sid, b"early", end_stream=True)
                                 elif authority.startswith(b"window"):
@@ -145,6 +159,15 @@ class Handler(socketserver.BaseRequestHandler):
                         if event.stream_id in tunnels:
                             sid = event.stream_id
                             authority = requests[sid][2][b":authority"]
+                            if self.server.mixed and authority.startswith(b"bulk"):
+                                bulk_received += len(event.data)
+                                conn.acknowledge_received_data(event.flow_controlled_length, sid)
+                                continue
+                            if self.server.mixed and authority.startswith(b"hold-upload"):
+                                held_received += len(event.data)
+                                if held_received > self.server.stream_window:
+                                    raise AssertionError("upload exceeded the withheld stream credit")
+                                continue
                             if authority.startswith(b"control"):
                                 requests[sid][1].extend(event.data)
                                 while b"\n" in requests[sid][1]:
@@ -163,6 +186,11 @@ class Handler(socketserver.BaseRequestHandler):
                                         response = (f"{window_sent}:"
                                                     f"{conn.local_flow_control_window(window_target)}:"
                                                     f"{window_credit}\n").encode()
+                                    elif self.server.mixed and command == b"bulk-status":
+                                        response = f"{bulk_received}\n".encode()
+                                    elif self.server.mixed and command == b"mixed-status":
+                                        response = (f"{window_sent}:{window_credit}:"
+                                                    f"{held_received}:{held_resets}\n").encode()
                                     else:
                                         response = command + b"\n"
                                     pending[sid] = pending.get(sid, b"") + response
@@ -257,6 +285,8 @@ class Handler(socketserver.BaseRequestHandler):
                     elif isinstance(event, h2.events.StreamReset):
                         self.server.event(connection=identity, reset=event.stream_id, code=int(event.error_code))
                         pending.pop(event.stream_id, None)
+                        if event.stream_id == held_stream:
+                            held_resets += 1
                     elif isinstance(event, h2.events.WindowUpdated):
                         self.server.event(connection=identity, window=event.stream_id, credit=event.delta)
                         if event.stream_id == window_target:
@@ -337,11 +367,18 @@ def main():
         peer = Peer(context, bad, stall_tls, stall_settings, window)
         peers.append(peer)
         threading.Thread(target=peer.serve_forever, daemon=True).start()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    context.set_alpn_protocols(["h2"])
+    mixed_peer = Peer(context, stream_window=65536, mixed=True)
+    peers.append(mixed_peer)
+    threading.Thread(target=mixed_peer.serve_forever, daemon=True).start()
     env = dict(os.environ, LIFETCHTO_H2_PORT=str(peers[0].server_address[1]),
                LIFETCHTO_H1_PORT=str(peers[1].server_address[1]), LIFETCHTO_H2_BAD_PORT=str(peers[2].server_address[1]), LIFETCHTO_H2_CA=str(cert),
                LIFETCHTO_H2_TLS_STALL_PORT=str(peers[3].server_address[1]),
                LIFETCHTO_H2_SETTINGS_STALL_PORT=str(peers[4].server_address[1]))
     env["LIFETCHTO_H2_WINDOW_PORT"] = str(peers[5].server_address[1])
+    env["LIFETCHTO_H2_MIXED_PORT"] = str(mixed_peer.server_address[1])
     try:
         result = subprocess.run([str(args.binary), "--gtest_filter=" + args.filter], env=env, timeout=90)
     finally:
@@ -350,7 +387,9 @@ def main():
             peer.server_close()
         (args.work_dir / "events.json").write_text(json.dumps([p.events for p in peers], indent=2))
     print(json.dumps({"child_peak_kib": resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
-                      "requests": sum("target" in event for p in peers for event in p.events)}), flush=True)
+                      "requests": sum("target" in event for p in peers for event in p.events),
+                      "mixed_connect_heads": [event for event in mixed_peer.events
+                                              if "bulk_before_head" in event]}), flush=True)
     failures = [v for p in peers for v in p.events if "failure" in v]
     if failures:
         raise AssertionError(failures)
