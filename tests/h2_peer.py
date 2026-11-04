@@ -122,6 +122,9 @@ class Handler(socketserver.BaseRequestHandler):
                                               authority=authority.decode())
                             if authority.startswith(b"stall"):
                                 continue
+                            if authority.startswith(b"initial-"):
+                                tunnels.add(sid)
+                                continue
                             if authority.startswith(b"deny"):
                                 conn.send_headers(sid, [(b":status", b"407")], end_stream=True)
                             else:
@@ -159,6 +162,30 @@ class Handler(socketserver.BaseRequestHandler):
                         if event.stream_id in tunnels:
                             sid = event.stream_id
                             authority = requests[sid][2][b":authority"]
+                            if authority.startswith(b"initial-"):
+                                requests[sid][1].extend(event.data)
+                                if sid not in tunnel_started:
+                                    tunnel_started.add(sid)
+                                    received = len(requests[sid][1])
+                                    self.server.event(connection=identity, stream=sid,
+                                                      initial_before_head=received)
+                                    status = b"407" if authority.startswith(b"initial-deny") else b"200"
+                                    conn.send_headers(sid, [(b":status", status),
+                                        (b"x-connection", str(identity).encode()),
+                                        (b"x-initial-before-head", str(received).encode())],
+                                        end_stream=status != b"200")
+                                    if authority.startswith(b"initial-fence"):
+                                        conn.send_data(sid, b"done", end_stream=True)
+                                        conn.reset_stream(sid, error_code=0)
+                                        tunnel_terminal.add(sid)
+                                if authority.startswith((b"initial-fence", b"initial-deny")):
+                                    if (self.server.stream_window is not None and
+                                            len(requests[sid][1]) > self.server.stream_window):
+                                        raise AssertionError("initial upload exceeded withheld credit")
+                                    continue
+                                conn.acknowledge_received_data(event.flow_controlled_length, sid)
+                                pending[sid] = pending.get(sid, b"") + event.data
+                                continue
                             if self.server.mixed and authority.startswith(b"bulk"):
                                 bulk_received += len(event.data)
                                 conn.acknowledge_received_data(event.flow_controlled_length, sid)

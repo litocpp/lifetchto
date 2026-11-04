@@ -20,6 +20,7 @@ enum class ConnectStage
     ConnectQueued,
     ConnectWrite,
     ConnectHead,
+    ConnectPayload,
     TunnelIo
 };
 auto connect_stage_name(ConnectStage stage) -> ref<str> {
@@ -31,6 +32,7 @@ auto connect_stage_name(ConnectStage stage) -> ref<str> {
     case ConnectStage::ConnectQueued: return "connect_queued"_str;
     case ConnectStage::ConnectWrite: return "connect_write"_str;
     case ConnectStage::ConnectHead: return "connect_head"_str;
+    case ConnectStage::ConnectPayload: return "connect_payload"_str;
     case ConnectStage::TunnelIo: return "tunnel_io"_str;
     }
     return "dial"_str;
@@ -40,11 +42,17 @@ struct ConnectProgress {
     u64          session_id {};
     u32          stream_id {};
 };
+struct InitialPayloadProgress {
+    usize total {}, confirmed {};
+    // Queued output may still be sent after failure; zero confirmed is not a replay guarantee.
+    bool may_have_been_sent {};
+};
 struct ConnectFailure {
-    ConnectStage stage;
-    u64          session_id {};
-    u32          stream_id {};
-    auto         progress() const -> ConnectProgress { return { stage, session_id, stream_id }; }
+    ConnectStage                   stage;
+    u64                            session_id {};
+    u32                            stream_id {};
+    Option<InitialPayloadProgress> initial_payload;
+    auto progress() const -> ConnectProgress { return { stage, session_id, stream_id }; }
 };
 auto protocol_error(String message, Option<lihttpto::DecodeError> cause = {}) -> Error {
     Option<Box<rstd::dyn<rstd::error::Error>>> owned;
@@ -86,9 +94,11 @@ struct Impl<error::Error, lifetchto::http::ConnectFailure>
 } // namespace rstd
 namespace lifetchto::http
 {
-auto connect_failure(Error error, ConnectProgress progress) -> Error {
-    return rstd::move(error).with_context(Box<rstd::dyn<rstd::error::Error>>::make(
-        ConnectFailure { progress.stage, progress.session_id, progress.stream_id }));
+auto connect_failure(Error                          error,
+                     ConnectProgress                progress,
+                     Option<InitialPayloadProgress> initial_payload = {}) -> Error {
+    return rstd::move(error).with_context(Box<rstd::dyn<rstd::error::Error>>::make(ConnectFailure {
+        progress.stage, progress.session_id, progress.stream_id, initial_payload }));
 }
 auto failure_progress(const Error& error, ConnectProgress fallback) -> ConnectProgress {
     if (error.context().is_some()) {

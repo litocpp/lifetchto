@@ -1096,3 +1096,197 @@ TEST(H2Tunnel, ResetWithoutEndAndNonzeroResetAfterEndKeepTypedFailures) {
     };
     runtime.block_on(run());
 }
+
+TEST(H2Tunnel, InitialPayloadArrivesBeforeFinalHeadAndRejectedInputIsReturned) {
+    if (! ::getenv("LIFETCHTO_H2_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        auto engine = Engine::make(runtime.handle()).unwrap();
+        auto client = tunnel_client(
+            engine, Duration::from_secs(u64(2)), "LIFETCHTO_H2_PORT", {}, {}, {}, Some(usize(32)));
+        Vec<u8> oversized;
+        oversized.resize(usize(33), u8('x'));
+        auto input    = Bytes::from_vec(rstd::move(oversized));
+        auto before   = engine.resources().usage().bytes;
+        auto rejected = client.open("initial-unused.test:443"_Str, {}, input.clone());
+        EXPECT_TRUE(rejected.is_err());
+        if (rejected.is_err()) {
+            auto failure = rstd::move(rejected).unwrap_err();
+            EXPECT_EQ(failure.input.data(), input.data());
+            EXPECT_EQ(failure.input.as_slice(), input.as_slice());
+        }
+        EXPECT_EQ(engine.resources().usage().bytes, before);
+        auto marker  = Bytes::copy_from_slice("early-initial"_bytes);
+        auto pending = client.open("initial-before-head.test:443"_Str, {}, marker.clone()).unwrap();
+        auto ready   = (co_await pending.connected()).unwrap();
+        EXPECT_EQ(ready.initial_payload_confirmed(), marker.len());
+        EXPECT_EQ(*ready.head().headers.get_unique_text("x-initial-before-head"_str).unwrap(),
+                  "13"_str);
+        auto progress = pending.initial_payload_progress();
+        EXPECT_TRUE(progress.is_some());
+        if (progress.is_some()) {
+            EXPECT_EQ(progress->total, marker.len());
+            EXPECT_EQ(progress->confirmed, marker.len());
+            EXPECT_TRUE(progress->may_have_been_sent);
+        }
+        auto stream = rstd::move(ready).into_stream();
+        EXPECT_EQ((co_await tunnel_receive(stream, marker.len())).as_slice(), marker.as_slice());
+        EXPECT_EQ((co_await stream.send_all(Bytes::copy_from_slice("tail"_bytes))).unwrap(),
+                  usize(4));
+        EXPECT_EQ((co_await tunnel_receive(stream, usize(4))).as_slice(), "tail"_bytes);
+        co_await tunnel_close_twice(stream);
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        EXPECT_EQ(engine.resources().usage().bytes, usize());
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
+
+TEST(H2Tunnel, InitialPayloadHeadAndPartialFailureKeepTheNativeWriteFence) {
+    if (! ::getenv("LIFETCHTO_H2_WINDOW_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        for (bool partial : array<bool, 2> { false, true }) {
+            auto engine = Engine::make(runtime.handle()).unwrap();
+            auto gate   = Arc<tunnel_test::Gate>::make();
+            auto connector =
+                Arc<rstd::dyn<http::TcpConnector>>::make(tunnel_test::Connector { gate.clone() });
+            auto client        = tunnel_client(engine,
+                                               Duration::from_secs(u64(2)),
+                                               "LIFETCHTO_H2_WINDOW_PORT",
+                                               Some(rstd::move(connector)));
+            auto sibling       = client.open("control-initial-sibling.test:443"_Str).unwrap();
+            auto sibling_ready = (co_await sibling.connected()).unwrap();
+            auto echo          = rstd::move(sibling_ready).into_stream();
+            EXPECT_TRUE((co_await echo.send_all(Bytes::copy_from_slice("warm\n"_bytes))).is_ok());
+            EXPECT_EQ((co_await tunnel_line(echo)).as_str(), "warm"_str);
+            EXPECT_TRUE((co_await echo.flush()).is_ok());
+            gate->fields.lock().unwrap()->armed = true;
+            Vec<u8> source;
+            source.resize(partial ? usize(4096) : usize(1024), u8('i'));
+            auto initial = Bytes::from_vec(rstd::move(source));
+            auto pending = client.open("initial-fence.test:443"_Str, {}, initial.clone()).unwrap();
+            auto connecting = pending.connected().into_future();
+            auto cx         = rstd::task::Context { rstd::task::Waker::noop() };
+            EXPECT_TRUE(rstd::future::poll(connecting, cx).is_pending());
+            for (;;) {
+                auto event = gate->changed.listen();
+                if (gate->fields.lock().unwrap()->blocked) break;
+                co_await rstd::move(event);
+            }
+            Option<lifetchto::Result<http::TunnelConnection>> observed;
+            auto deadline = rstd::time::Instant::now() + Duration::from_secs(u64(2));
+            while (rstd::time::Instant::now() < deadline) {
+                auto state = rstd::future::poll(connecting, cx);
+                if (state.is_ready()) {
+                    observed = Some(rstd::move(state).take());
+                    break;
+                }
+                if (pending.progress().stage == http::ConnectStage::ConnectPayload) break;
+                co_await rstd::async::yield_now();
+            }
+            auto progress = pending.initial_payload_progress();
+            EXPECT_TRUE(progress.is_some());
+            if (progress.is_some()) {
+                EXPECT_EQ(progress->confirmed, usize());
+                EXPECT_TRUE(progress->may_have_been_sent);
+            }
+            EXPECT_GT(engine.resources().usage().bytes, usize());
+            using Closing = decltype(pending.close().into_future());
+            Option<Closing> closing;
+            if (partial) {
+                pending.request_stop();
+                {
+                    auto abandoned = pending.close().into_future();
+                    EXPECT_TRUE(rstd::future::poll(abandoned, cx).is_pending());
+                }
+                closing = Some(pending.close().into_future());
+                EXPECT_TRUE(rstd::future::poll(*closing, cx).is_pending());
+            } else {
+                EXPECT_TRUE(observed.is_none());
+                EXPECT_EQ(pending.progress().stage, http::ConnectStage::ConnectPayload);
+            }
+            gate->release();
+            if (closing.is_some()) EXPECT_TRUE((co_await rstd::future::by_ref(*closing)).is_ok());
+            if (observed.is_none()) observed = Some(co_await rstd::future::by_ref(connecting));
+            if (partial) {
+                EXPECT_TRUE(observed->is_err());
+                if (observed->is_err()) {
+                    auto error = rstd::move(*observed).unwrap_err();
+                    auto phase = tunnel_cause<http::ConnectFailure>(
+                        rstd::dyn<rstd::error::Error>::from_ref(error).deref());
+                    EXPECT_TRUE(phase.is_some());
+                    if (phase.is_some()) {
+                        EXPECT_TRUE((*phase)->initial_payload.is_some());
+                        if ((*phase)->initial_payload.is_some()) {
+                            EXPECT_EQ((*phase)->initial_payload->total, usize(4096));
+                            EXPECT_LE((*phase)->initial_payload->confirmed, usize(1024));
+                            EXPECT_TRUE((*phase)->initial_payload->may_have_been_sent);
+                        }
+                    }
+                }
+            } else {
+                EXPECT_TRUE(observed->is_ok());
+                if (observed->is_ok()) {
+                    auto ready = rstd::move(*observed).unwrap();
+                    EXPECT_EQ(ready.initial_payload_confirmed(), usize(1024));
+                    auto stream = rstd::move(ready).into_stream();
+                    EXPECT_EQ((co_await tunnel_receive(stream, usize(4))).as_slice(), "done"_bytes);
+                    EXPECT_TRUE((co_await stream.recv()).unwrap().is_empty());
+                    co_await tunnel_close_twice(stream);
+                }
+            }
+            auto final = pending.initial_payload_progress();
+            EXPECT_TRUE(final.is_some());
+            if (final.is_some()) EXPECT_EQ(final->confirmed, usize(1024));
+            EXPECT_FALSE(gate->fields.lock().unwrap()->stopped);
+            EXPECT_TRUE(
+                (co_await echo.send_all(Bytes::copy_from_slice("survives\n"_bytes))).is_ok());
+            EXPECT_EQ((co_await tunnel_line(echo)).as_str(), "survives"_str);
+            co_await tunnel_close_twice(echo);
+            EXPECT_TRUE((co_await client.close()).is_ok());
+            EXPECT_TRUE((co_await engine.close()).is_ok());
+            EXPECT_EQ(engine.resources().usage().bytes, usize());
+        }
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}
+
+TEST(H2Tunnel, RejectedInitialPayloadPreservesHttpStatusAndFinalProgress) {
+    if (! ::getenv("LIFETCHTO_H2_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto run     = [&]() -> coro<empty> {
+        auto engine  = Engine::make(runtime.handle()).unwrap();
+        auto client  = tunnel_client(engine);
+        auto marker  = Bytes::copy_from_slice("send-once"_bytes);
+        auto pending = client.open("initial-deny.test:443"_Str, {}, marker.clone()).unwrap();
+        auto result  = co_await pending.connected();
+        EXPECT_TRUE(result.is_err());
+        if (result.is_err()) {
+            auto error  = rstd::move(result).unwrap_err();
+            auto status = tunnel_cause<http::ProxyConnectFailure>(
+                rstd::dyn<rstd::error::Error>::from_ref(error).deref());
+            EXPECT_TRUE(status.is_some());
+            if (status.is_some()) EXPECT_EQ((*status)->response.status.value(), u16(407));
+            auto phase = tunnel_cause<http::ConnectFailure>(
+                rstd::dyn<rstd::error::Error>::from_ref(error).deref());
+            EXPECT_TRUE(phase.is_some());
+            if (phase.is_some()) EXPECT_TRUE((*phase)->initial_payload.is_some());
+        }
+        EXPECT_TRUE((co_await pending.close()).is_ok());
+        auto progress = pending.initial_payload_progress();
+        EXPECT_TRUE(progress.is_some());
+        if (progress.is_some()) {
+            EXPECT_EQ(progress->total, marker.len());
+            EXPECT_EQ(progress->confirmed, marker.len());
+            EXPECT_TRUE(progress->may_have_been_sent);
+        }
+        EXPECT_TRUE((co_await client.close()).is_ok());
+        EXPECT_TRUE((co_await engine.close()).is_ok());
+        EXPECT_EQ(engine.resources().usage().bytes, usize());
+        co_return empty {};
+    };
+    runtime.block_on(run());
+}

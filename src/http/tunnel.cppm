@@ -8,14 +8,20 @@ struct TunnelStreamState;
 class TunnelConnection {
     lihttpto::ResponseHead  head_;
     rstd::async::io::Stream stream_;
+    usize                   initial_payload_confirmed_ {};
 
 public:
-    TunnelConnection(lihttpto::ResponseHead head, rstd::async::io::Stream stream)
-        : head_(rstd::move(head)), stream_(rstd::move(stream)) {}
+    TunnelConnection(lihttpto::ResponseHead  head,
+                     rstd::async::io::Stream stream,
+                     usize                   initial_payload_confirmed = {})
+        : head_(rstd::move(head)),
+          stream_(rstd::move(stream)),
+          initial_payload_confirmed_(initial_payload_confirmed) {}
     TunnelConnection(TunnelConnection&&) noexcept                    = default;
     TunnelConnection(const TunnelConnection&)                        = delete;
     auto operator=(TunnelConnection&&) noexcept -> TunnelConnection& = default;
     auto head() const -> const lihttpto::ResponseHead& { return head_; }
+    auto initial_payload_confirmed() const -> usize { return initial_payload_confirmed_; }
     auto into_stream() && -> rstd::async::io::Stream { return rstd::move(stream_); }
 };
 class PendingTunnel {
@@ -31,6 +37,7 @@ public:
     ~PendingTunnel();
     auto connected() const -> coro<Result<TunnelConnection>>;
     auto progress() const -> ConnectProgress;
+    auto initial_payload_progress() const -> Option<InitialPayloadProgress>;
     void request_stop() const;
     auto close() const -> coro<Result<empty>>;
 };
@@ -52,6 +59,9 @@ public:
     auto        clone() const -> TunnelClient;
     auto        open(String authority, Vec<lihttpto::h2::Field> fields = {}) const
         -> Result<PendingTunnel>;
+    // Accepts at most upload_window bytes before the response; connected still requires 2xx.
+    auto open(String authority, Vec<lihttpto::h2::Field> fields, Bytes initial_payload) const
+        -> rstd::Result<PendingTunnel, Rejected<Bytes>>;
     void request_close() const;
     auto close() const -> coro<Result<empty>>;
     auto wait_closed() const -> coro<CleanupReport>;
