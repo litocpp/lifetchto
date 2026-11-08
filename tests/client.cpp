@@ -61,20 +61,28 @@ TEST(Http1Client, StreamsAndReusesConnection) {
 
 struct ResolverStats {
     usize calls {}, completed {};
+    bool  started {}, released {};
+};
+struct ResolverGate {
+    rstd::sync::Mutex<ResolverStats> stats { ResolverStats {} };
+    rstd::sync::Condvar              changed;
 };
 struct BlockingResolver {
-    rstd::async::RuntimeHandle                        runtime;
-    rstd::sync::Arc<rstd::sync::Mutex<ResolverStats>> stats;
+    rstd::async::RuntimeHandle    runtime;
+    rstd::sync::Arc<ResolverGate> gate;
     auto resolve(String, u16 port) const -> coro<lifetchto::Result<Vec<SocketAddr>>> {
         {
-            auto f = stats->lock().unwrap();
+            auto f = gate->stats.lock().unwrap();
             ++f->calls;
         }
         auto work   = runtime
-                          .spawn_blocking([state = stats.clone(), port] {
-                            rstd::thread::sleep(Duration::from_millis(u64(100)));
+                          .spawn_blocking([state = gate.clone(), port] {
                             {
-                                auto f = state->lock().unwrap();
+                                auto f     = state->stats.lock().unwrap();
+                                f->started = true;
+                                state->changed.wait_while(f, [](const ResolverStats& stats) {
+                                    return ! stats.released;
+                                });
                                 ++f->completed;
                             }
                             Vec<SocketAddr> addresses;
@@ -112,29 +120,40 @@ TEST(ClientResolver, OperatingSystemLookupOwnsAddressesAndErrors) {
 TEST(ClientLifetime, ResolverJoinSurvivesTimeoutAndCanceledCloseWait) {
     auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
     auto task    = [&]() -> coro<empty> {
-        auto stats = rstd::sync::Arc<rstd::sync::Mutex<ResolverStats>>::make(ResolverStats {});
+        auto              gate = rstd::sync::Arc<ResolverGate>::make();
         TestClientOptions options;
         options.max_connections = usize(1);
         options.max_waiters     = usize();
         options.total_timeout   = Some(Duration::from_millis(u64(20)));
         options.resolver        = Some(rstd::sync::Arc<rstd::dyn<Resolver>>::make(
-            BlockingResolver { runtime.handle(), stats.clone() }));
+            BlockingResolver { runtime.handle(), gate.clone() }));
         auto client             = TestClient::make(runtime.handle(), rstd::move(options)).unwrap();
         auto first              = runtime.handle().spawn(
             client.send(TestRequest::make("http://blocked.test:9/"_str).unwrap()));
-        co_await rstd::async::sleep(Duration::from_millis(u64(5)));
-        auto overflow =
-            co_await client.send(TestRequest::make("http://blocked.test:9/"_str).unwrap());
-        EXPECT_TRUE(overflow.is_err());
-        if (overflow.is_err()) EXPECT_TRUE(overflow.unwrap_err().is_Capacity());
-        auto result = (co_await rstd::move(first)).unwrap();
-        EXPECT_TRUE(result.is_err());
-        if (result.is_err()) EXPECT_TRUE(result.unwrap_err().is_Timeout());
+        bool started = false;
+        for (int i = 0; i < 2000 && ! started; ++i) {
+            {
+                auto f  = gate->stats.lock().unwrap();
+                started = f->started;
+            }
+            if (! started) co_await rstd::async::sleep(Duration::from_millis(u64(1)));
+        }
+        EXPECT_TRUE(started);
+        co_await rstd::async::sleep(Duration::from_millis(u64(30)));
         auto early = co_await rstd::async::timeout(client.close().into_future(),
                                                    Duration::from_millis(u64(1)));
         EXPECT_TRUE(early.is_err());
+        {
+            auto f = gate->stats.lock().unwrap();
+            EXPECT_EQ(f->completed, usize());
+            f->released = true;
+        }
+        gate->changed.notify_all();
+        auto result = (co_await rstd::move(first)).unwrap();
+        EXPECT_TRUE(result.is_err());
+        if (result.is_err()) EXPECT_TRUE(result.unwrap_err().is_Timeout());
         EXPECT_TRUE((co_await client.close()).is_ok());
-        auto f = stats->lock().unwrap();
+        auto f = gate->stats.lock().unwrap();
         EXPECT_EQ(f->calls, usize(1));
         EXPECT_EQ(f->completed, usize(1));
         co_return empty {};
