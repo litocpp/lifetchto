@@ -1,6 +1,6 @@
 [package]
 name = "lifetchto"
-version = "0.1.0"
+version = "0.1.1"
 license = "MIT OR Apache-2.0"
 authors = ["hypengw <hypengwip@gmail.com>"]
 
@@ -19,7 +19,7 @@ default = false
 default = false
 
 [dependencies]
-rstd-std = { version = "0.1.11", pub = true }
+rstd-std = { version = "0.1.12", pub = true }
 lihttpto = { version = "0.1.2", pub = true, condition = "feature.http" }
 licrypto = { version = "0.2.1", features = ["openssl"], pub = true, condition = "feature.http && feature.tls" }
 

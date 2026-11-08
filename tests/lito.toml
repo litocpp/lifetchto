@@ -8,8 +8,8 @@ sources = ["main.cpp", "core.cpp", "core_session.cpp", "core_duplex.cpp", "polic
 link-stdlib = false
 
 [dependencies]
-lifetchto = { version = "0.1.0", features = ["http", "tls", "http2"] }
-rstd-test = { version = "0.1.11" }
-rstd-nostd = { version = "0.1.11", usage = "link" }
+lifetchto = { version = "0.1.1", features = ["http", "tls", "http2"] }
+rstd-test = { version = "0.1.12" }
+rstd-nostd = { version = "0.1.12", usage = "link" }
 
 liserveto = { version = "0.1.0" }
