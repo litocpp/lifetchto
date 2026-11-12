@@ -60,6 +60,8 @@ public:
     auto        select(const lihttpto::Url&, i64 now) const -> Result<lihttpto::CookieHeader>;
     auto store(const lihttpto::Url&, const lihttpto::SetCookie&, i64 now) const -> Result<empty>;
     auto snapshot(i64 now) const -> Result<Vec<lihttpto::StoredCookie>>;
+    auto snapshot_all() const -> Result<Vec<lihttpto::StoredCookie>>;
+    auto replace_snapshot(Vec<lihttpto::StoredCookie> cookies) const -> Result<empty>;
     auto import_netscape(ref<str> input, i64 now) const -> Result<empty>;
     auto export_netscape(i64 now) const -> Result<String>;
     auto clear() const -> Result<empty>;

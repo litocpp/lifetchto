@@ -9,6 +9,21 @@ using lf::Arc;
 using lf::Bytes;
 using lf::coro;
 using lf::Duration;
+TEST(MemoryCookieJar, SnapshotRestoresAndRespectsClose) {
+    auto original = h::MemoryCookieJar::make().unwrap();
+    auto url = lihttpto::Url::parse_http("https://example.test/a"_str).unwrap();
+    auto cookie = lihttpto::SetCookie::parse("sid=one; Path=/; HttpOnly"_str).unwrap();
+    ASSERT_TRUE(original.store(url, cookie, i64(100)).is_ok());
+    auto snapshot = original.snapshot_all();
+    ASSERT_TRUE(snapshot.is_ok());
+    auto restored = h::MemoryCookieJar::make().unwrap();
+    ASSERT_TRUE(restored.replace_snapshot(rstd::move(*snapshot)).is_ok());
+    auto selected = restored.select(url, i64(100));
+    ASSERT_TRUE(selected.is_ok());
+    EXPECT_EQ(selected->encode().as_str(), "sid=one"_str);
+    restored.request_close();
+    EXPECT_TRUE(restored.snapshot_all().is_err());
+}
 namespace
 {
 auto request(ref<str> path = "http://example.test/item"_str, ref<str> method = "GET"_str)

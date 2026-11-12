@@ -49,6 +49,20 @@ auto MemoryCookieJar::snapshot(i64 now) const -> Result<Vec<lihttpto::StoredCook
     if (f->closed) return Err(Error::Closed());
     return Ok(f->storage.snapshot(now));
 }
+auto MemoryCookieJar::snapshot_all() const -> Result<Vec<lihttpto::StoredCookie>> {
+    auto f = state_->fields.lock().unwrap();
+    if (f->closed) return Err(Error::Closed());
+    return Ok(f->storage.snapshot_all());
+}
+auto MemoryCookieJar::replace_snapshot(Vec<lihttpto::StoredCookie> cookies) const -> Result<empty> {
+    auto f = state_->fields.lock().unwrap();
+    if (f->closed) return Err(Error::Closed());
+    auto restored = f->storage.replace_snapshot(rstd::move(cookies));
+    if (restored.is_err())
+        return Err(Error::Extension("cookie snapshot"_Str,
+                                    Box<rstd::dyn<rstd::error::Error>>::make(restored.unwrap_err())));
+    return Ok(empty {});
+}
 auto MemoryCookieJar::import_netscape(ref<str> input, i64 now) const -> Result<empty> {
     auto f = state_->fields.lock().unwrap();
     if (f->closed) return Err(Error::Closed());
