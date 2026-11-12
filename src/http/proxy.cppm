@@ -24,22 +24,48 @@ struct ProxyCapabilities {
 };
 class ProxyEndpoint {
     struct State {
-        lihttpto::Url url;
-        ProxyType     type;
-        u16           port;
-        State(lihttpto::Url url, ProxyType type, u16 port)
-            : url(rstd::move(url)), type(type), port(port) {}
+        lihttpto::Url   url;
+        ProxyType       type;
+        u16             port;
+        Option<Vec<u8>> username;
+        Vec<u8>         password;
+        State(lihttpto::Url   url,
+              ProxyType       type,
+              u16             port,
+              Option<Vec<u8>> username,
+              Vec<u8>         password)
+            : url(rstd::move(url)),
+              type(type),
+              port(port),
+              username(rstd::move(username)),
+              password(rstd::move(password)) {}
     };
     Arc<State> state_;
     explicit ProxyEndpoint(Arc<State> state): state_(rstd::move(state)) {}
+    static auto credentials(ref<str> value) -> Vec<u8> {
+        Vec<u8> result;
+        for (usize i {}; i < value.len(); ++i) {
+            auto byte = value.as_bytes()[i];
+            if (byte == u8('%') && i + usize(2) < value.len()) {
+                auto high = rstd::ascii::digit_value(value.as_bytes()[i + usize(1)], u8(16));
+                auto low  = rstd::ascii::digit_value(value.as_bytes()[i + usize(2)], u8(16));
+                if (high.is_some() && low.is_some()) {
+                    result.push(u8(high->to_primitive() * 16 + low->to_primitive()));
+                    i += usize(2);
+                    continue;
+                }
+            }
+            result.push(u8(byte));
+        }
+        return result;
+    }
 
 public:
     static auto make(lihttpto::Url url) -> Result<ProxyEndpoint> {
-        if (url.host().is_none() || url.host()->is_empty() || url.userinfo().is_some() ||
-            url.query().is_some() || url.fragment().is_some() ||
-            (! url.path().is_empty() && url.path() != "/"_str))
+        if (url.host().is_none() || url.host()->is_empty() || url.query().is_some() ||
+            url.fragment().is_some() || (! url.path().is_empty() && url.path() != "/"_str))
             return Err(Error::InvalidOptions(
-                "proxy requires an origin without userinfo, path, query or fragment"_Str));
+                "proxy requires an origin without path, query or fragment"_Str));
         auto scheme = url.scheme();
         if (scheme.is_none()) return Err(Error::InvalidOptions("proxy scheme is required"_Str));
         ProxyType type;
@@ -65,13 +91,57 @@ public:
         }
         if (port.is_none()) port = Some(u16(1080));
         if (*port == u16()) return Err(Error::InvalidOptions("proxy port must be positive"_Str));
-        return Ok(ProxyEndpoint(Arc<State>::make(rstd::move(url), type, *port)));
+        Option<Vec<u8>> username;
+        Vec<u8>         password;
+        if (url.userinfo().is_some()) {
+            username = Some(credentials(url.username()));
+            password = credentials(url.password());
+            if ((type == ProxyType::Socks5 || type == ProxyType::Socks5h) &&
+                (username->len() > usize(255) || password.len() > usize(255)))
+                return Err(Error::InvalidOptions("invalid SOCKS5 credential length"_Str));
+        }
+        auto origin = rstd::format("{}://{}", *scheme, *url.host());
+        if (url.port().is_some()) {
+            origin.push_ascii(':');
+            origin.push_str(*url.port());
+        }
+        origin.push_str(url.path());
+        auto sanitized = lihttpto::Url::parse(origin.as_str());
+        if (sanitized.is_err()) return Err(Error::InvalidOptions("invalid proxy origin"_Str));
+        return Ok(ProxyEndpoint(Arc<State>::make(
+            rstd::move(*sanitized), type, *port, rstd::move(username), rstd::move(password))));
     }
     auto clone() const -> ProxyEndpoint { return ProxyEndpoint(state_.clone()); }
     auto url() const -> const lihttpto::Url& { return state_->url; }
     auto type() const -> ProxyType { return state_->type; }
     auto port() const -> u16 { return state_->port; }
     auto host_name() const -> String { return String::make(*state_->url.host_name()); }
+    auto username() const -> Option<slice<u8>> {
+        return state_->username.is_some() ? Some(state_->username->as_slice()) : None<slice<u8>>();
+    }
+    auto password() const -> slice<u8> { return state_->password.as_slice(); }
+    auto authorization() const -> Option<String> {
+        if (state_->username.is_none()) return None();
+        Vec<u8> input;
+        input.extend_from_slice(state_->username->as_slice());
+        input.push(u8(':'));
+        input.extend_from_slice(state_->password.as_slice());
+        constexpr char alphabet[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        String result = "Basic "_Str;
+        auto   bytes  = input.as_slice();
+        for (usize i {}; i < input.len(); i += usize(3)) {
+            auto first  = bytes[i].to_primitive();
+            auto second = i + usize(1) < input.len() ? bytes[i + usize(1)].to_primitive() : 0;
+            auto third  = i + usize(2) < input.len() ? bytes[i + usize(2)].to_primitive() : 0;
+            result.push_ascii(alphabet[first >> 2]);
+            result.push_ascii(alphabet[((first & 3) << 4) | (second >> 4)]);
+            result.push_ascii(
+                i + usize(1) < input.len() ? alphabet[((second & 15) << 2) | (third >> 6)] : '=');
+            result.push_ascii(i + usize(2) < input.len() ? alphabet[third & 63] : '=');
+        }
+        return Some(rstd::move(result));
+    }
 };
 struct ProxyEnvironment {
     Option<String> http, https, all, no_proxy;

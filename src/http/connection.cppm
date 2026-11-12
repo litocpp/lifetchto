@@ -2,6 +2,7 @@ module;
 #include <rstd/macro.hpp>
 module lifetchto.http:connection;
 import :state;
+using rstd::time::Duration;
 using namespace rstd::prelude;
 namespace lifetchto::http
 {
@@ -144,15 +145,27 @@ auto proxy_io(coro<Result<T>> operation, Arc<BodyState> body, Instant deadline) 
 }
 auto proxy_tunnel(Connection&             connection,
                   const lihttpto::Url&    target,
+                  const ProxyEndpoint&    proxy,
                   Arc<BodyState>          body,
                   Instant                 deadline,
                   const TransportOptions& options) -> coro<Result<empty>> {
-    auto request = lihttpto::connect_request(target, options.head_limit);
+    lihttpto::Headers fields;
+    auto              authorization = proxy.authorization();
+    if (authorization.is_some()) {
+        auto header = fields.set("Proxy-Authorization"_str, authorization->as_str());
+        if (header.is_err())
+            co_return Err(Error::Protocol(
+                "invalid proxy authorization"_Str,
+                Some(Box<rstd::dyn<rstd::error::Error>>::make(rstd::move(header).unwrap_err()))));
+    }
+    auto request = lihttpto::connect_request(target, fields, options.head_limit);
     if (request.is_err())
         co_return Err(protocol_error("invalid CONNECT request"_Str, Some(request.unwrap_err())));
     auto sent =
         co_await proxy_io(connection.send(rstd::move(request).unwrap()), body.clone(), deadline);
     if (sent.is_err()) co_return Err(rstd::move(sent).unwrap_err());
+    auto flushed = co_await proxy_io(connection.flush(), body.clone(), deadline);
+    if (flushed.is_err()) co_return Err(rstd::move(flushed).unwrap_err());
     lihttpto::TunnelHeadDecoder head(options.head_limit);
     Bytes                       bytes;
     for (;;) {
@@ -221,6 +234,212 @@ auto proxy_tunnel(Connection&             connection,
                             Some(Box<rstd::dyn<rstd::error::Error>>::make(rstd::move(failure)))));
     }
 }
+auto resolve_endpoint(Arc<NativeState> client, String host, u16 port)
+    -> coro<Result<Vec<rstd::net::SocketAddr>>> {
+    Vec<rstd::net::SocketAddr> addresses;
+    auto                       ipv4 = rstd::net::Ipv4Addr::parse(host.as_str());
+    if (ipv4.is_ok()) {
+        addresses.push(rstd::net::SocketAddr::ipv4(*ipv4, port));
+        co_return Ok(rstd::move(addresses));
+    }
+    auto ipv6 = rstd::net::Ipv6Addr::parse(host.as_str());
+    if (ipv6.is_ok()) {
+        addresses.push(rstd::net::SocketAddr::ipv6(*ipv6, port, u32(), u32()));
+        co_return Ok(rstd::move(addresses));
+    }
+    if (client->options.resolver.is_some())
+        co_return co_await (*client->options.resolver)->resolve(rstd::move(host), port);
+    auto spawned = client->runtime.spawn_blocking([host = rstd::move(host), port] {
+        return rstd::net::lookup_host(host.as_str(), port);
+    });
+    if (spawned.is_err()) co_return Err(Error::Connect(rstd::move(spawned).unwrap_err()));
+    auto joined = co_await rstd::move(spawned).unwrap();
+    if (joined.is_err()) co_return Err(Error::Closed());
+    auto result = rstd::move(joined).unwrap();
+    if (result.is_err()) co_return Err(Error::Resolve(rstd::move(result).unwrap_err()));
+    co_return Ok(rstd::move(result).unwrap());
+}
+auto proxy_read_exact(Connection& connection, usize length, Arc<BodyState> body, Instant deadline)
+    -> coro<Result<Vec<u8>>> {
+    Vec<u8> bytes;
+    while (bytes.len() < length) {
+        auto received =
+            co_await proxy_io(connection.recv(length - bytes.len()), body.clone(), deadline);
+        if (received.is_err()) co_return Err(rstd::move(received).unwrap_err());
+        if (received->is_empty())
+            co_return Err(protocol_error("proxy closed during SOCKS5 handshake"_Str,
+                                         Some(lihttpto::DecodeError::Truncated)));
+        bytes.extend_from_slice(received->as_slice());
+    }
+    co_return Ok(rstd::move(bytes));
+}
+auto proxy_send(Connection& connection, Vec<u8> bytes, Arc<BodyState> body, Instant deadline)
+    -> coro<Result<empty>> {
+    auto sent = co_await proxy_io(
+        connection.send(Bytes::copy_from_slice(bytes.as_slice())), body.clone(), deadline);
+    if (sent.is_err()) co_return Err(rstd::move(sent).unwrap_err());
+    if (*sent != bytes.len())
+        co_return Err(Error::Contract("incomplete proxy handshake write"_Str));
+    co_return co_await proxy_io(connection.flush(), rstd::move(body), deadline);
+}
+auto socks5_tunnel(Connection&          connection,
+                   const lihttpto::Url& target,
+                   const ProxyEndpoint& proxy,
+                   Arc<NativeState>     client,
+                   Arc<BodyState>       body,
+                   Instant              deadline) -> coro<Result<empty>> {
+    auto    username = proxy.username();
+    auto    password = proxy.password();
+    Vec<u8> greeting;
+    greeting.push(u8(5));
+    greeting.push(u8(1));
+    greeting.push(username.is_some() ? u8(2) : u8());
+    rstd_co_try(co_await proxy_send(connection, rstd::move(greeting), body.clone(), deadline));
+    auto method =
+        rstd_co_try(co_await proxy_read_exact(connection, usize(2), body.clone(), deadline));
+    auto method_bytes = method.as_slice();
+    auto expected     = username.is_some() ? u8(2) : u8();
+    if (method_bytes[usize()] != u8(5) || method_bytes[usize(1)] != expected)
+        co_return Err(protocol_error("SOCKS5 proxy rejected the authentication method"_Str));
+    if (username.is_some()) {
+        if (username->len() > usize(255) || password.len() > usize(255))
+            co_return Err(Error::InvalidOptions("invalid SOCKS5 credential length"_Str));
+        Vec<u8> authentication;
+        authentication.push(u8(1));
+        authentication.push(u8(username->len().to_primitive()));
+        authentication.extend_from_slice(*username);
+        authentication.push(u8(password.len().to_primitive()));
+        authentication.extend_from_slice(password);
+        rstd_co_try(
+            co_await proxy_send(connection, rstd::move(authentication), body.clone(), deadline));
+        auto reply =
+            rstd_co_try(co_await proxy_read_exact(connection, usize(2), body.clone(), deadline));
+        auto bytes = reply.as_slice();
+        if (bytes[usize()] != u8(1) || bytes[usize(1)] != u8())
+            co_return Err(protocol_error("SOCKS5 proxy authentication failed"_Str));
+    }
+    auto origin  = target.http_origin().unwrap();
+    auto address = target.numeric_address();
+    if (address.is_none() && proxy.type() == ProxyType::Socks5) {
+        auto resolved = rstd_co_try(co_await resolve_endpoint(
+            client.clone(), String::make(*target.host_name()), origin.port));
+        if (resolved.is_empty() || resolved.len() > usize(64)) co_return Err(Error::Capacity());
+        address = Some(rstd::net::SocketAddr(resolved.as_slice()[usize()]));
+    }
+    Vec<u8> request;
+    request.push(u8(5));
+    request.push(u8(1));
+    request.push(u8());
+    if (address.is_some()) {
+        request.push(address->is_ipv4() ? u8(1) : u8(4));
+        auto length = address->is_ipv4() ? usize(4) : usize(16);
+        for (usize i {}; i < length; ++i) request.push(address->octet(i));
+    } else {
+        auto host = target.host_name().unwrap().as_bytes();
+        if (host.is_empty() || host.len() > usize(255))
+            co_return Err(Error::InvalidOptions("SOCKS5 target hostname is too long"_Str));
+        request.push(u8(3));
+        request.push(u8(host.len().to_primitive()));
+        request.extend_from_slice(host);
+    }
+    request.push(u8(origin.port.to_primitive() >> 8));
+    request.push(u8(origin.port.to_primitive() & 255));
+    rstd_co_try(co_await proxy_send(connection, rstd::move(request), body.clone(), deadline));
+    auto reply =
+        rstd_co_try(co_await proxy_read_exact(connection, usize(4), body.clone(), deadline));
+    auto bytes = reply.as_slice();
+    if (bytes[usize()] != u8(5) || bytes[usize(2)] != u8())
+        co_return Err(protocol_error("invalid SOCKS5 CONNECT response"_Str));
+    if (bytes[usize(1)] != u8())
+        co_return Err(
+            protocol_error(rstd::format("SOCKS5 CONNECT failed with status {}", bytes[usize(1)])));
+    usize length;
+    switch (bytes[usize(3)].to_primitive()) {
+    case 1: length = usize(4); break;
+    case 4: length = usize(16); break;
+    case 3: {
+        auto size =
+            rstd_co_try(co_await proxy_read_exact(connection, usize(1), body.clone(), deadline));
+        length = usize(size.as_slice()[usize()].to_primitive());
+        if (length == usize()) co_return Err(protocol_error("empty SOCKS5 bound hostname"_Str));
+        break;
+    }
+    default: co_return Err(protocol_error("invalid SOCKS5 bound address type"_Str));
+    }
+    (void)rstd_co_try(
+        co_await proxy_read_exact(connection, length + usize(2), body.clone(), deadline));
+    co_return Ok(empty {});
+}
+#if LITO_FEAT_TLS
+auto secure_connection(Connection&          connection,
+                       const lihttpto::Url& url,
+                       const TlsProfile&    profile,
+                       Arc<BodyState>       body,
+                       Instant              deadline,
+                       Duration             close_timeout) -> coro<Result<empty>> {
+    if (! connection.pending.is_empty()) {
+        body->record_cleanup(co_await connection.close());
+        co_return Err(protocol_error("unexpected data before tunneled TLS handshake"_Str));
+    }
+    bool canceled;
+    {
+        auto fields = body->fields.lock().unwrap();
+        canceled    = fields->canceled;
+    }
+    if (canceled || Instant::now() >= deadline) {
+        body->record_cleanup(co_await connection.close());
+        co_return Err(canceled ? Error::Canceled() : Error::Timeout());
+    }
+    auto name = [&]() -> licrypto::CryptoResult<licrypto::tls::ServerName> {
+        auto address = url.numeric_address();
+        if (address.is_some()) {
+            if (address->is_ipv4())
+                return Ok(licrypto::tls::ServerName::ip(address->ipv4_address().unwrap()));
+            return Ok(licrypto::tls::ServerName::ip(address->ipv6_address().unwrap()));
+        }
+        return licrypto::tls::ServerName::dns(*url.host_name());
+    }();
+    if (name.is_err()) {
+        body->record_cleanup(co_await connection.close());
+        co_return Err(tls_error(rstd::move(name).unwrap_err()));
+    }
+    licrypto::tls::StreamOptions options;
+    options.handshake_timeout = remaining(deadline);
+    options.close_timeout     = close_timeout;
+    licrypto::tls::Connector connector(profile.context(), options);
+    auto transport = connection.tls.is_some()
+                         ? rstd::move(connection.tls.take().unwrap()).into_stream()
+                         : connection.tcp.take().unwrap();
+    auto tls       = co_await connector.connect(rstd::move(transport), rstd::move(name).unwrap());
+    if (tls.is_err()) co_return Err(tls_error(rstd::move(tls).unwrap_err()));
+    connection.tls = Some(rstd::move(tls).unwrap());
+    {
+        auto fields = body->fields.lock().unwrap();
+        canceled    = fields->canceled;
+    }
+    if (canceled || Instant::now() >= deadline) {
+        body->record_cleanup(co_await connection.close());
+        co_return Err(canceled ? Error::Canceled() : Error::Timeout());
+    }
+    auto protocol = connection.tls->application_protocol();
+    if (protocol.is_err()) {
+        body->record_cleanup(co_await connection.close());
+        co_return Err(tls_error(rstd::move(protocol).unwrap_err()));
+    }
+    bool h2 = protocol->as_slice() == "h2"_str.as_bytes();
+    bool h1 = protocol->is_empty() || protocol->as_slice() == "http/1.1"_str.as_bytes();
+#if ! LITO_FEAT_HTTP2
+    h2 = false;
+#endif
+    if ((! h1 && ! h2) || (h1 && profile.version_policy() == VersionPolicy::Http2) ||
+        (h2 && profile.version_policy() == VersionPolicy::Http1)) {
+        body->record_cleanup(co_await connection.close());
+        co_return Err(Error::Unsupported("server negotiated unsupported ALPN"_Str));
+    }
+    connection.http2 = h2;
+    co_return Ok(empty {});
+}
+#endif
 auto connect_deadline(const TransportOptions& options, const BodyState& body) -> Instant {
     auto result = Instant::now() + options.connect_timeout;
     if (body.deadline.is_some() && *body.deadline < result) result = *body.deadline;
@@ -328,9 +547,10 @@ auto connect_native(Arc<NativeState>     client,
         co_return Err(Error::Unsupported(String::make("Unix sockets unavailable"_str)));
 #endif
     }
-    auto                       origin         = url.http_origin().unwrap();
-    const auto&                destination    = slot->proxy.is_some() ? slot->proxy->url() : url;
-    auto                       connect_origin = destination.http_origin().unwrap();
+    auto origin = url.http_origin().unwrap();
+    auto connect_host =
+        slot->proxy.is_some() ? slot->proxy->host_name() : String::make(*url.host_name());
+    auto connect_port = slot->proxy.is_some() ? slot->proxy->port() : origin.port;
     Vec<rstd::net::SocketAddr> addresses;
     if (slot->route.is_some() && (*slot->route)->endpoint_connector().is_some()) {
         auto prepared = (*(*slot->route)->endpoint_connector())->prepare();
@@ -357,25 +577,11 @@ auto connect_native(Arc<NativeState>     client,
         connection.tcp = Some(rstd::move(*stream));
     } else if (slot->route.is_some()) {
         for (auto address : (*slot->route)->addresses()) addresses.push(rstd::move(address));
-    } else if (auto numeric = destination.numeric_address(); numeric.is_some())
-        addresses.push(numeric.unwrap());
-    else if (client->options.resolver.is_some()) {
-        // Resolver futures remain owned until they complete, even after the caller times out.
-        auto result = co_await (*client->options.resolver)
-                          ->resolve(connect_origin.host.clone(), connect_origin.port);
-        if (result.is_err()) co_return Err(rstd::move(result).unwrap_err());
-        addresses = rstd::move(result).unwrap();
     } else {
-        auto spawned = client->runtime.spawn_blocking(
-            [host = connect_origin.host.clone(), port = connect_origin.port] {
-                return rstd::net::lookup_host(host.as_str(), port);
-            });
-        if (spawned.is_err()) co_return Err(Error::Connect(spawned.unwrap_err()));
-        auto joined = co_await rstd::move(spawned).unwrap();
-        if (joined.is_err()) co_return Err(Error::Closed());
-        auto result = rstd::move(joined).unwrap();
-        if (result.is_err()) co_return Err(Error::Resolve(rstd::move(result).unwrap_err()));
-        addresses = rstd::move(result).unwrap();
+        auto resolved =
+            co_await resolve_endpoint(client.clone(), rstd::move(connect_host), connect_port);
+        if (resolved.is_err()) co_return Err(rstd::move(resolved).unwrap_err());
+        addresses = rstd::move(resolved).unwrap();
     }
     if ((addresses.is_empty() && connection.tcp.is_none()) || addresses.len() > usize(64))
         co_return Err(Error::Capacity());
@@ -400,10 +606,47 @@ auto connect_native(Arc<NativeState>     client,
     }
     if (connection.tcp.is_none())
         co_return Err(last.is_some() ? last.take().unwrap() : Error::Capacity());
-    if (slot->proxy.is_some() && (force_tunnel || origin.scheme == "https"_str)) {
+    if (slot->proxy.is_some()) {
         body->set_connect_stage(ConnectStage::ProxyConnect);
-        auto tunnel =
-            co_await proxy_tunnel(connection, url, body.clone(), deadline, client->options);
+        Result<empty> tunnel = Ok(empty {});
+        switch (slot->proxy->type()) {
+        case ProxyType::Http:
+            if (force_tunnel || origin.scheme == "https"_str)
+                tunnel = co_await proxy_tunnel(
+                    connection, url, *slot->proxy, body.clone(), deadline, client->options);
+            break;
+        case ProxyType::Https: {
+#if LITO_FEAT_TLS
+            if (client->options.proxy_tls.is_none()) {
+                body->record_cleanup(co_await connection.close());
+                co_return Err(Error::InvalidOptions("HTTPS proxy requires a TLS profile"_Str));
+            }
+            auto secured = co_await secure_connection(connection,
+                                                      slot->proxy->url(),
+                                                      *client->options.proxy_tls,
+                                                      body.clone(),
+                                                      deadline,
+                                                      client->options.tls_close_timeout);
+            if (secured.is_err()) co_return Err(rstd::move(secured).unwrap_err());
+            if (force_tunnel || origin.scheme == "https"_str)
+                tunnel = co_await proxy_tunnel(
+                    connection, url, *slot->proxy, body.clone(), deadline, client->options);
+#else
+            body->record_cleanup(co_await connection.close());
+            co_return Err(Error::Unsupported("HTTPS proxy requires feature tls"_Str));
+#endif
+            break;
+        }
+        case ProxyType::Socks5:
+        case ProxyType::Socks5h:
+            tunnel = co_await socks5_tunnel(
+                connection, url, *slot->proxy, client.clone(), body.clone(), deadline);
+            break;
+        case ProxyType::Socks4:
+        case ProxyType::Socks4a:
+            body->record_cleanup(co_await connection.close());
+            co_return Err(Error::Unsupported("SOCKS4 proxy is unsupported"_Str));
+        }
         if (tunnel.is_err()) {
             body->record_cleanup(co_await connection.close());
             co_return Err(rstd::move(tunnel).unwrap_err());
@@ -411,54 +654,17 @@ auto connect_native(Arc<NativeState>     client,
     }
     if (origin.scheme.as_str() == "https"_str) {
         body->set_connect_stage(ConnectStage::Tls);
-        if (! connection.pending.is_empty()) {
-            body->record_cleanup(co_await connection.close());
-            co_return Err(protocol_error("unexpected data before tunneled TLS handshake"_Str));
-        }
 #if LITO_FEAT_TLS
-        if (Instant::now() >= deadline) {
-            body->record_cleanup(co_await connection.close());
-            co_return Err(Error::Timeout());
-        }
-        auto                         context = client->options.tls->context();
-        licrypto::tls::StreamOptions options;
-        options.handshake_timeout = remaining(deadline);
-        options.close_timeout     = client->options.tls_close_timeout;
-        licrypto::tls::Connector connector(rstd::move(context), options);
-        auto                     name = [&]() -> licrypto::CryptoResult<licrypto::tls::ServerName> {
-            auto address = url.numeric_address();
-            if (address.is_some()) {
-                if (address->is_ipv4())
-                    return Ok(licrypto::tls::ServerName::ip(address->ipv4_address().unwrap()));
-                return Ok(licrypto::tls::ServerName::ip(address->ipv6_address().unwrap()));
-            }
-            return licrypto::tls::ServerName::dns(origin.host.as_str());
-        }();
-        if (name.is_err()) {
-            body->record_cleanup(co_await connection.close());
-            co_return Err(tls_error(rstd::move(name).unwrap_err()));
-        }
-        auto tls =
-            co_await connector.connect(connection.tcp.take().unwrap(), rstd::move(name).unwrap());
-        if (tls.is_err()) co_return Err(tls_error(rstd::move(tls).unwrap_err()));
-        connection.tls = Some(rstd::move(tls).unwrap());
-        auto protocol  = connection.tls->application_protocol();
-        bool h2        = protocol.is_ok() && protocol->as_slice() == "h2"_str.as_bytes();
-        bool h1 = protocol.is_ok() &&
-                  (protocol->is_empty() || protocol->as_slice() == "http/1.1"_str.as_bytes());
-#if ! LITO_FEAT_HTTP2
-        h2 = false;
-#endif
-        if ((! h1 && ! h2) ||
-            (h1 && client->options.tls->version_policy() == VersionPolicy::Http2) ||
-            (h2 && client->options.tls->version_policy() == VersionPolicy::Http1)) {
-            body->record_cleanup(co_await connection.close());
-            co_return Err(Error::Unsupported("server negotiated unsupported ALPN"_Str));
-        }
-        connection.http2 = h2;
+        auto secured = co_await secure_connection(connection,
+                                                  url,
+                                                  *client->options.tls,
+                                                  body.clone(),
+                                                  deadline,
+                                                  client->options.tls_close_timeout);
+        if (secured.is_err()) co_return Err(rstd::move(secured).unwrap_err());
 #else
         body->record_cleanup(co_await connection.close());
-        co_return Err(Error::Unsupported(String::make("HTTPS requires feature tls"_str)));
+        co_return Err(Error::Unsupported("HTTPS requires feature tls"_Str));
 #endif
     }
     co_return Ok(rstd::move(connection));

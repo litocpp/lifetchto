@@ -544,7 +544,13 @@ auto NativeBackend::clone() const -> NativeBackend {
 }
 auto NativeBackend::make(ResourceContext resources, TransportOptions options)
     -> Result<NativeBackend> {
-    auto proxy = options.proxy.validate({ .http = true, .system_snapshot = true });
+    auto proxy = options.proxy.validate({ .http = true,
+#if LITO_FEAT_TLS
+                                          .https = true,
+#endif
+                                          .socks5          = true,
+                                          .socks5h         = true,
+                                          .system_snapshot = true });
     if (proxy.is_err()) return Err(rstd::move(proxy).unwrap_err());
     auto tcp =
         options.tcp.validate({ true, true, rstd::net::TcpStream::keepalive_timing_supported() });
@@ -565,6 +571,13 @@ auto NativeBackend::make(ResourceContext resources, TransportOptions options)
         if (profile.is_err()) return Err(rstd::move(profile).unwrap_err());
         options.tls = Some(rstd::move(profile).unwrap());
     }
+    if (options.proxy.enabled() && options.proxy_tls.is_none()) {
+        auto profile = TlsProfile::make({}, VersionPolicy::Http1);
+        if (profile.is_err()) return Err(rstd::move(profile).unwrap_err());
+        options.proxy_tls = Some(rstd::move(profile).unwrap());
+    }
+    if (options.proxy_tls.is_some() && options.proxy_tls->version_policy() != VersionPolicy::Http1)
+        return Err(Error::InvalidOptions("HTTPS proxy TLS profile must use HTTP/1"_Str));
 #endif
     auto state    = Arc<NativeState>::make(resources.clone(), rstd::move(options));
     auto attached = resources.attach(
@@ -601,10 +614,25 @@ auto NativeBackend::prepare(lihttpto::RequestParts parts,
     if (proxy.is_err()) return Err(rstd::move(proxy).unwrap_err());
     if (proxy->is_some() && route.route.is_some())
         return Err(Error::InvalidOptions("proxy conflicts with an explicit route"_Str));
-    auto target_form = proxy->is_some() && origin->scheme == "http"_str
-                           ? lihttpto::TargetForm::Absolute
-                           : lihttpto::TargetForm::Origin;
-    auto prepared    = lihttpto::PreparedRequest::make(
+    auto forward_proxy =
+        proxy->is_some() &&
+        ((**proxy).type() == ProxyType::Http || (**proxy).type() == ProxyType::Https) &&
+        origin->scheme == "http"_str;
+    auto target_form =
+        forward_proxy ? lihttpto::TargetForm::Absolute : lihttpto::TargetForm::Origin;
+    if (forward_proxy) {
+        auto authorization = (**proxy).authorization();
+        if (authorization.is_some()) {
+            auto header = parts.headers.set("Proxy-Authorization"_str, authorization->as_str());
+            if (header.is_err())
+                return Err(Error::Protocol("invalid proxy authorization"_Str,
+                                           Some(Box<rstd::dyn<rstd::error::Error>>::make(
+                                               rstd::move(header).unwrap_err()))));
+        }
+    } else {
+        (void)parts.headers.remove("proxy-authorization"_str);
+    }
+    auto prepared = lihttpto::PreparedRequest::make(
         rstd::move(parts),
         upload.length,
         state_->options.head_limit,
@@ -677,7 +705,13 @@ auto NativeBackend::capabilities() const -> BackendCapabilities {
              .tls_verification = true,
 #endif
              .connect_timeout = true,
-             .proxy           = { .http = true, .system_snapshot = true } };
+             .proxy           = { .http = true,
+#if LITO_FEAT_TLS
+                        .https = true,
+#endif
+                        .socks5          = true,
+                        .socks5h         = true,
+                        .system_snapshot = true } };
 }
 void NativeBackend::request_close() const {
     stop_client(state_);

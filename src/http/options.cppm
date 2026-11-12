@@ -131,6 +131,7 @@ struct TransportOptions {
     Option<rstd::sync::Arc<rstd::dyn<Resolver>>> resolver;
 #if LITO_FEAT_TLS
     Option<TlsProfile> tls;
+    Option<TlsProfile> proxy_tls;
 #endif
 };
 } // namespace lifetchto::http
