@@ -45,6 +45,7 @@ public:
     }
 };
 struct MemoryCookieState;
+using CookieSnapshotVisitor = rstd::FnMut<void(slice<lihttpto::StoredCookie>, Option<u64>)>;
 class MemoryCookieJar {
     Arc<MemoryCookieState> state_;
     explicit MemoryCookieJar(Arc<MemoryCookieState> state);
@@ -61,6 +62,10 @@ public:
     auto store(const lihttpto::Url&, const lihttpto::SetCookie&, i64 now) const -> Result<empty>;
     auto snapshot(i64 now) const -> Result<Vec<lihttpto::StoredCookie>>;
     auto snapshot_all() const -> Result<Vec<lihttpto::StoredCookie>>;
+    auto revision() const -> Result<Option<u64>>;
+    // Calls synchronously under the lock with all entries, including expired ones.
+    // The visitor must not retain the view or reenter this jar (including its clones).
+    auto with_snapshot(mut_ref<rstd::dyn<CookieSnapshotVisitor>> visitor) const -> Result<empty>;
     auto replace_snapshot(Vec<lihttpto::StoredCookie> cookies) const -> Result<empty>;
     auto import_netscape(ref<str> input, i64 now) const -> Result<empty>;
     auto export_netscape(i64 now) const -> Result<String>;

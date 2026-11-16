@@ -11,8 +11,8 @@ using lf::coro;
 using lf::Duration;
 TEST(MemoryCookieJar, SnapshotRestoresAndRespectsClose) {
     auto original = h::MemoryCookieJar::make().unwrap();
-    auto url = lihttpto::Url::parse_http("https://example.test/a"_str).unwrap();
-    auto cookie = lihttpto::SetCookie::parse("sid=one; Path=/; HttpOnly"_str).unwrap();
+    auto url      = lihttpto::Url::parse_http("https://example.test/a"_str).unwrap();
+    auto cookie   = lihttpto::SetCookie::parse("sid=one; Path=/; HttpOnly"_str).unwrap();
     ASSERT_TRUE(original.store(url, cookie, i64(100)).is_ok());
     auto snapshot = original.snapshot_all();
     ASSERT_TRUE(snapshot.is_ok());
@@ -23,6 +23,152 @@ TEST(MemoryCookieJar, SnapshotRestoresAndRespectsClose) {
     EXPECT_EQ(selected->encode().as_str(), "sid=one"_str);
     restored.request_close();
     EXPECT_TRUE(restored.snapshot_all().is_err());
+}
+TEST(MemoryCookieJar, SnapshotVisitorBorrowsContentAndRevisionAcrossClones) {
+    auto original = h::MemoryCookieJar::make().unwrap();
+    auto shared   = original.clone();
+    auto url      = lihttpto::Url::parse_http("https://example.test/"_str).unwrap();
+    auto cookie   = lihttpto::SetCookie::parse("sid=one; Max-Age=1"_str).unwrap();
+    EXPECT_EQ(shared.revision().unwrap(), Some(u64()));
+    usize calls {};
+    auto  empty = [&](slice<lihttpto::StoredCookie> entries, Option<u64> revision) {
+        ++calls;
+        EXPECT_TRUE(entries.is_empty());
+        EXPECT_EQ(revision, Some(u64()));
+    };
+    ASSERT_TRUE(
+        original.with_snapshot(rstd::dyn<h::CookieSnapshotVisitor>::from_ref(empty)).is_ok());
+    ASSERT_TRUE(shared.store(url, cookie, i64(100)).is_ok());
+    EXPECT_EQ(original.revision().unwrap(), Some(u64(1)));
+    rstd::uintptr_t address {};
+    auto            inspect = [&](slice<lihttpto::StoredCookie> entries, Option<u64> revision) {
+        ++calls;
+        static_assert(__is_same(decltype(entries[usize()]), const lihttpto::StoredCookie&));
+        ASSERT_EQ(entries.len(), usize(1));
+        EXPECT_EQ(entries[usize()].cookie.value(), "one"_str);
+        EXPECT_EQ(entries[usize()].raw_cookie.as_str(), "sid=one; Max-Age=1"_str);
+        EXPECT_EQ(entries[usize()].expires, Some(i64(101)));
+        EXPECT_EQ(revision, Some(u64(1)));
+        auto current = reinterpret_cast<rstd::uintptr_t>(entries.as_raw_ptr());
+        if (address != 0) EXPECT_EQ(current, address);
+        address = current;
+    };
+    auto visitor = rstd::dyn<h::CookieSnapshotVisitor>::from_ref(inspect);
+    EXPECT_TRUE(original.with_snapshot(visitor).is_ok());
+    EXPECT_TRUE(shared.with_snapshot(visitor).is_ok());
+    EXPECT_TRUE(original.store(url, cookie, i64(100)).is_ok());
+    EXPECT_EQ(shared.revision().unwrap(), Some(u64(1)));
+    EXPECT_TRUE(shared.with_snapshot(visitor).is_ok());
+    EXPECT_TRUE(original.select(url, i64(101)).unwrap().is_empty());
+    EXPECT_TRUE(shared.with_snapshot(visitor).is_ok());
+    EXPECT_EQ(calls, usize(5));
+    auto owned            = original.snapshot_all().unwrap();
+    owned[usize()].domain = "other.test"_Str;
+    EXPECT_TRUE(shared.with_snapshot(visitor).is_ok());
+    EXPECT_TRUE(shared.replace_snapshot(rstd::move(owned)).is_ok());
+    EXPECT_EQ(original.revision().unwrap(), Some(u64(2)));
+    EXPECT_TRUE(original.clear().is_ok());
+    EXPECT_EQ(shared.revision().unwrap(), Some(u64(3)));
+    EXPECT_TRUE(shared.clear().is_ok());
+    EXPECT_EQ(original.revision().unwrap(), Some(u64(3)));
+}
+TEST(MemoryCookieJar, RevisionTracksImportEraseAndSnapshotExpiration) {
+    auto jar  = h::MemoryCookieJar::make().unwrap();
+    auto file = "example.test\tFALSE\t/\tFALSE\t101\tsid\tone\n"_str;
+    EXPECT_TRUE(jar.import_netscape(file, i64(100)).is_ok());
+    EXPECT_EQ(jar.revision().unwrap(), Some(u64(1)));
+    EXPECT_TRUE(jar.import_netscape(file, i64(100)).is_ok());
+    EXPECT_TRUE(jar.replace_snapshot(jar.snapshot_all().unwrap()).is_ok());
+    EXPECT_TRUE(jar.import_netscape("invalid"_str, i64(100)).is_err());
+    EXPECT_FALSE(jar.erase("example.test"_str, "/"_str, "missing"_str).unwrap());
+    EXPECT_EQ(jar.revision().unwrap(), Some(u64(1)));
+    EXPECT_TRUE(jar.snapshot(i64(101)).unwrap().is_empty());
+    EXPECT_EQ(jar.revision().unwrap(), Some(u64(2)));
+    EXPECT_TRUE(jar.import_netscape(file, i64(100)).is_ok());
+    EXPECT_TRUE(jar.erase("example.test"_str, "/"_str, "sid"_str).unwrap());
+    EXPECT_EQ(jar.revision().unwrap(), Some(u64(4)));
+}
+TEST(MemoryCookieJar, SnapshotRevisionMatchesContentDuringConcurrentStores) {
+    auto jar = h::MemoryCookieJar::make().unwrap();
+    auto url = lihttpto::Url::parse_http("https://example.test/"_str).unwrap();
+    ASSERT_TRUE(jar.store(url, lihttpto::SetCookie::parse("sid=1"_str).unwrap(), i64(100)).is_ok());
+    using rstd::sync::atomic::Ordering;
+    rstd::sync::atomic::Atomic<bool> start { false };
+    auto                             worker =
+        rstd::thread::spawn([shared = jar.clone(), &url, &start] {
+            while (! start.load(Ordering::Acquire)) rstd::thread::yield_now();
+            for (u64 version(2); version <= u64(201); ++version) {
+                auto text = rstd::format("sid={}", version);
+                if (shared.store(url, lihttpto::SetCookie::parse(text.as_str()).unwrap(), i64(100))
+                        .is_err())
+                    return false;
+                rstd::thread::yield_now();
+            }
+            return true;
+        }).unwrap();
+    usize calls {};
+    auto  inspect = [&](slice<lihttpto::StoredCookie> entries, Option<u64> revision) {
+        ++calls;
+        ASSERT_EQ(entries.len(), usize(1));
+        ASSERT_TRUE(revision.is_some());
+        auto expected = rstd::format("{}", *revision);
+        EXPECT_EQ(entries[usize()].cookie.value(), expected.as_str());
+    };
+    auto visitor = rstd::dyn<h::CookieSnapshotVisitor>::from_ref(inspect);
+    start.store(true, Ordering::Release);
+    for (unsigned i = 0; i < 300; ++i) {
+        EXPECT_TRUE(jar.with_snapshot(visitor).is_ok());
+        rstd::thread::yield_now();
+    }
+    EXPECT_TRUE(rstd::move(worker).join().unwrap());
+    EXPECT_EQ(calls, usize(300));
+    EXPECT_EQ(jar.revision().unwrap(), Some(u64(201)));
+    EXPECT_TRUE(jar.with_snapshot(visitor).is_ok());
+}
+TEST(MemoryCookieJar, ClosedRevisionAndVisitorRejectWithoutCallingVisitor) {
+    auto original = h::MemoryCookieJar::make().unwrap();
+    auto shared   = original.clone();
+    auto url      = lihttpto::Url::parse_http("https://example.test/"_str).unwrap();
+    auto cookie   = lihttpto::SetCookie::parse("sid=one"_str).unwrap();
+    ASSERT_TRUE(shared.store(url, cookie, i64(100)).is_ok());
+    usize calls {};
+    auto  inspect = [&](slice<lihttpto::StoredCookie>, Option<u64>) {
+        ++calls;
+    };
+    auto visitor = rstd::dyn<h::CookieSnapshotVisitor>::from_ref(inspect);
+    original.request_close();
+    original.request_close();
+    EXPECT_TRUE(original.revision().unwrap_err().is_Closed());
+    EXPECT_TRUE(shared.revision().unwrap_err().is_Closed());
+    EXPECT_TRUE(original.with_snapshot(visitor).unwrap_err().is_Closed());
+    EXPECT_TRUE(shared.with_snapshot(visitor).unwrap_err().is_Closed());
+    EXPECT_EQ(calls, usize());
+    EXPECT_TRUE(shared.snapshot_all().unwrap_err().is_Closed());
+    EXPECT_TRUE(shared.snapshot(i64(100)).unwrap_err().is_Closed());
+    EXPECT_TRUE(shared.store(url, cookie, i64(100)).unwrap_err().is_Closed());
+    EXPECT_TRUE(shared.select(url, i64(100)).unwrap_err().is_Closed());
+    EXPECT_TRUE(shared.clear().unwrap_err().is_Closed());
+    EXPECT_TRUE(shared.erase("example.test"_str, "/"_str, "sid"_str).unwrap_err().is_Closed());
+    EXPECT_TRUE(shared.replace_snapshot({}).unwrap_err().is_Closed());
+    EXPECT_TRUE(shared.import_netscape(""_str, i64(100)).unwrap_err().is_Closed());
+    EXPECT_TRUE(shared.export_netscape(i64(100)).unwrap_err().is_Closed());
+}
+TEST(MemoryCookieJar, CloseRejectsRevisionAndVisitorBeforeAwait) {
+    auto  jar     = h::MemoryCookieJar::make().unwrap();
+    auto  shared  = jar.clone();
+    auto  closing = jar.close();
+    usize calls {};
+    auto  inspect = [&](slice<lihttpto::StoredCookie>, Option<u64>) {
+        ++calls;
+    };
+    EXPECT_TRUE(shared.revision().unwrap_err().is_Closed());
+    EXPECT_TRUE(shared.with_snapshot(rstd::dyn<h::CookieSnapshotVisitor>::from_ref(inspect))
+                    .unwrap_err()
+                    .is_Closed());
+    EXPECT_EQ(calls, usize());
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    EXPECT_TRUE(runtime.block_on(rstd::move(closing)).is_ok());
+    EXPECT_TRUE(runtime.block_on(shared.close()).is_ok());
 }
 namespace
 {
