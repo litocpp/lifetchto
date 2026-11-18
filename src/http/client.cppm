@@ -56,14 +56,7 @@ struct RedirectPolicy {
     bool        allow_cross_origin {}, allow_https_downgrade {}, rewrite_post_301_302 { true };
     Vec<String> remove_on_cross_origin;
     Option<Arc<rstd::dyn<RedirectDecider>>> decider;
-    auto                                    clone() const -> RedirectPolicy {
-        return { max_hops,
-                 allow_cross_origin,
-                 allow_https_downgrade,
-                 rewrite_post_301_302,
-                 remove_on_cross_origin.clone(),
-                 decider.clone() };
-    }
+    auto                                    clone() const -> RedirectPolicy;
 };
 struct RetryPolicy {
     usize       max_retries { 3 }, connect_retries { 3 }, status_retries { 3 };
@@ -73,22 +66,13 @@ struct RetryPolicy {
         max_backoff { Duration::from_secs(u64(10)) }, jitter;
     bool                                 respect_retry_after { true }, business_idempotent {};
     Option<Arc<rstd::dyn<RetryDecider>>> decider;
-    auto                                 clone() const -> RetryPolicy {
-        return { max_retries,         connect_retries,  status_retries,
-                 methods.clone(),     statuses.clone(), backoff,
-                 max_backoff,         jitter,           respect_retry_after,
-                 business_idempotent, decider.clone() };
-    }
+    auto                                 clone() const -> RetryPolicy;
 };
 struct ExecutionPolicy {
     Option<RedirectPolicy> redirect;
     Option<RetryPolicy>    retry;
     CacheMode              cache { CacheMode::Disabled };
-    auto                   clone() const -> ExecutionPolicy {
-        return { redirect.is_some() ? Some(redirect->clone()) : None<RedirectPolicy>(),
-                 retry.is_some() ? Some(retry->clone()) : None<RetryPolicy>(),
-                 cache };
-    }
+    auto                   clone() const -> ExecutionPolicy;
 };
 struct RouteProvider {
     template<class Self, class = void>
@@ -115,13 +99,7 @@ struct AttemptReport {
     RemoteOutcome         remote;
     Progress              progress;
     Option<FailureReport> error;
-    auto                  clone() const -> AttemptReport {
-        return { target.clone(),
-                 status,
-                 remote,
-                 progress,
-                 error.is_some() ? Some(error->clone()) : None<FailureReport>() };
-    }
+    auto                  clone() const -> AttemptReport;
 };
 struct ExecutionFacts {
     Option<lihttpto::RequestParts> request;
@@ -135,20 +113,7 @@ struct ExecutionFacts {
     Instant                        started { Instant::now() };
     Option<Instant>                head_received;
     BodyTraffic                    body_progress;
-    auto                           clone() const -> ExecutionFacts {
-        ExecutionFacts copy;
-        copy.request = request.is_some() ? Some(request->clone()) : None<lihttpto::RequestParts>();
-        copy.from_cache        = from_cache;
-        copy.cache             = cache;
-        copy.history_truncated = history_truncated;
-        copy.redirects         = redirects;
-        copy.attempts          = attempts;
-        copy.started           = started;
-        copy.head_received     = head_received;
-        copy.body_progress     = body_progress;
-        for (const auto& item : history) copy.history.push(item.clone());
-        return copy;
-    }
+    auto                           clone() const -> ExecutionFacts;
 };
 struct ExecutionReport {
     ExecutionFacts      facts;
@@ -172,12 +137,7 @@ public:
         value.state_ = state_.clone();
         return value;
     }
-    auto snapshot() const -> ExecutionFacts {
-        auto f               = state_->fields.lock().unwrap();
-        auto result          = f->facts.clone();
-        result.body_progress = f->body_progress.snapshot();
-        return result;
-    }
+    auto snapshot() const -> ExecutionFacts;
     auto wait() const -> coro<Result<ExecutionReport>>;
 
 private:
@@ -192,15 +152,7 @@ struct ExecuteOptions {
     Option<ExecutionObserver> report;
     Option<TotalTimeout>      total_timeout;
     RequestCookies            cookies;
-    auto                      clone() const -> ExecuteOptions {
-        return { transfer,
-                 policy.is_some() ? Some(policy->clone()) : None<ExecutionPolicy>(),
-                 routing.is_some() ? Some(routing->clone()) : None<Routing>(),
-                 partition.clone(),
-                 report.is_some() ? Some(report->clone()) : None<ExecutionObserver>(),
-                 total_timeout,
-                 cookies.clone() };
-    }
+    auto                      clone() const -> ExecuteOptions;
 };
 struct ClientConfig {
     ExecutionPolicy       policy;
@@ -212,16 +164,7 @@ struct ClientConfig {
     Option<CookieBinding> cookies;
     Routing               routing;
     auto                  validate() const -> Result<empty>;
-    auto                  clone() const -> ClientConfig {
-        return { policy.clone(),
-                 cache.is_some() ? Some(cache->clone()) : None<CacheBinding>(),
-                 store_failure,
-                 total_timeout,
-                 drain_limit,
-                 drain_timeout,
-                 cookies.is_some() ? Some(cookies->clone()) : None<CookieBinding>(),
-                 routing.clone() };
-    }
+    auto                  clone() const -> ClientConfig;
 };
 struct ClientState;
 class Client {

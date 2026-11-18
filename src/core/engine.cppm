@@ -37,21 +37,9 @@ export struct CleanupReport {
     usize              total_errors {};
     auto               is_ok() const -> bool { return total_errors == usize(); }
     auto               is_err() const -> bool { return ! is_ok(); }
-    auto               clone() const -> CleanupReport {
-        CleanupReport report;
-        report.total_errors = total_errors;
-        for (const auto& error : errors) report.errors.push(error.clone());
-        return report;
-    }
-    void add(FailureReport error) {
-        ++total_errors;
-        if (errors.len() < usize(16)) errors.push(rstd::move(error));
-    }
-    void merge(CleanupReport report) {
-        total_errors += report.total_errors;
-        for (auto& error : report.errors)
-            if (errors.len() < usize(16)) errors.push(rstd::move(error));
-    }
+    auto               clone() const -> CleanupReport;
+    void               add(FailureReport error);
+    void               merge(CleanupReport report);
 };
 struct CleanupFields {
     Vec<Error>    pending;
@@ -76,18 +64,9 @@ struct CloseOutcomeFields {
 };
 struct CloseOutcome {
     rstd::sync::Mutex<CloseOutcomeFields> fields { CloseOutcomeFields {} };
-    void                                  complete(Result<empty> result) {
-        auto f = fields.lock().unwrap();
-        if (result.is_err()) {
-            f->report.total_errors = usize(1);
-            f->report.errors.push(report_failure(result.as_ref().unwrap_err()));
-        }
-        f->result = Some(rstd::move(result));
-    }
-    auto report() const -> CleanupReport { return fields.lock().unwrap()->report.clone(); }
-    auto take_result() const -> Option<Result<empty>> {
-        return fields.lock().unwrap()->result.take();
-    }
+    void                                  complete(Result<empty> result);
+    auto                                  report() const -> CleanupReport;
+    auto                                  take_result() const -> Option<Result<empty>>;
 };
 export struct ResourceAmount {
     usize operations {}, tasks {}, resources {}, bytes {};
@@ -167,17 +146,8 @@ struct ResourceRecord {
           cleanup(Arc<CleanupState>::make(Some(rstd::move(parent)))) {
         if (! leased) cleanup->forward();
     }
-    void stop(StopReason reason) {
-        {
-            auto f = flags.lock().unwrap();
-            if (f->done) return;
-        }
-        owner->request_stop(reason);
-    }
-    auto finished() const -> bool {
-        auto f = flags.lock().unwrap();
-        return f->joined || (f->ready && f->done && task.is_some() && task->is_finished());
-    }
+    void stop(StopReason reason);
+    auto finished() const -> bool;
 };
 void start_release(const Arc<ResourceRecord>& record);
 auto take_resource_result(const Arc<ResourceRecord>& record) -> Option<Result<empty>>;
@@ -303,17 +273,9 @@ public:
     explicit TaskControl(const Arc<ResourceRecord>& record)
         : record_(record.downgrade()), observation_(record->observation.clone()) {}
     auto clone() const -> TaskControl { return TaskControl(record_.clone(), observation_.clone()); }
-    void cancel() const {
-        auto record = record_.upgrade();
-        if (record) record->stop(StopReason::Canceled);
-    }
-    auto is_finished() const -> bool {
-        auto record = record_.upgrade();
-        return ! record || record->finished();
-    }
-    auto wait() const -> coro<CleanupReport> {
-        return observe_resource(record_.clone(), observation_.clone());
-    }
+    void cancel() const;
+    auto is_finished() const -> bool;
+    auto wait() const -> coro<CleanupReport>;
 };
 template<class D>
 struct TaskState {
@@ -359,18 +321,9 @@ public:
     auto runtime() const -> rstd::async::RuntimeHandle { return scope_->runtime.clone(); }
     auto handle() const -> EngineHandle;
     void record_cleanup_error(Error error) const { scope_->cleanup->record(rstd::move(error)); }
-    auto usage() const -> ResourceAmount {
-        auto f = scope_->budget->fields.lock().unwrap();
-        return f->used;
-    }
-    auto closed() const -> bool {
-        auto f = scope_->fields.lock().unwrap();
-        return f->closed || scope_->cancellation.is_canceled();
-    }
-    auto try_reserve(ResourceAmount amount) const -> Result<ResourcePermit> {
-        if (closed()) return Err(Error::Closed());
-        return lifetchto::try_reserve(scope_->budget.clone(), amount);
-    }
+    auto usage() const -> ResourceAmount;
+    auto closed() const -> bool;
+    auto try_reserve(ResourceAmount amount) const -> Result<ResourcePermit>;
     template<class T>
     auto attach(T access, Arc<rstd::dyn<ManagedResource>> owner)
         -> rstd::Result<ResourceLease<T>, Rejected<ResourceRegistration<T>>> {
@@ -407,16 +360,7 @@ export struct ProtocolCompletion {
 export struct ProtocolReport {
     rstd::Result<empty, FailureReport> result;
     RemoteOutcome                      remote { RemoteOutcome::Unknown };
-    static auto capture(const ProtocolCompletion& completion) -> ProtocolReport {
-        using ReportResult = rstd::Result<empty, FailureReport>;
-        return { completion.result.is_ok()
-                     ? ReportResult(Ok(empty {}))
-                     : ReportResult(
-                           Err(completion.diagnostic.is_some()
-                                   ? completion.diagnostic->clone()
-                                   : report_failure(completion.result.as_ref().unwrap_err()))),
-                 completion.remote };
-    }
+    static auto capture(const ProtocolCompletion& completion) -> ProtocolReport;
 };
 export struct TransferReport {
     const ProtocolReport     logical;
@@ -482,13 +426,7 @@ public:
     explicit TransferControl(Arc<OperationState> state): state_(rstd::move(state)) {}
     auto clone() const -> TransferControl { return TransferControl(state_.clone()); }
     void cancel() const { stop_operation(state_, StopReason::Canceled); }
-    auto snapshot() const -> TransferSnapshot {
-        auto f            = state_->fields.lock().unwrap();
-        auto progress     = f->progress;
-        auto attempts     = state_->attempts->fields.lock().unwrap();
-        progress.attempts = attempts->used;
-        return { f->phase, f->output_ready, progress, state_->scope->cancellation.reason() };
-    }
+    auto snapshot() const -> TransferSnapshot;
     auto wait() const -> coro<Arc<TransferReport>>;
     auto close() const -> coro<Arc<TransferReport>> {
         cancel();
@@ -520,28 +458,8 @@ public:
     auto cancellation() const -> Cancellation { return state_->scope->cancellation.clone(); }
     auto deadline() const -> Option<Instant> { return state_->deadline; }
     auto control() const -> TransferControl { return TransferControl(state_.clone()); }
-    auto begin_attempt() const -> Result<AttemptPermit> {
-        if (cancellation().is_canceled()) return Err(stop_error(*cancellation().reason()));
-        if (state_->deadline.is_some() && Instant::now() >= *state_->deadline)
-            return Err(Error::Timeout());
-        usize used;
-        {
-            auto f = state_->attempts->fields.lock().unwrap();
-            if (f->used >= f->maximum) return Err(Error::AttemptsExhausted());
-            used = ++f->used;
-        }
-        {
-            auto progress               = state_->fields.lock().unwrap();
-            progress->progress.attempts = used;
-        }
-        return Ok(AttemptPermit { used });
-    }
-    void progress(Option<u64> accepted, Option<u64> sent, Option<u64> received) const {
-        auto f                     = state_->fields.lock().unwrap();
-        f->progress.accepted_bytes = accepted;
-        f->progress.sent_bytes     = sent;
-        f->progress.received_bytes = received;
-    }
+    auto begin_attempt() const -> Result<AttemptPermit>;
+    void progress(Option<u64> accepted, Option<u64> sent, Option<u64> received) const;
     auto delay(Duration duration) const -> coro<Result<empty>>;
     template<class T>
     auto submit(PreparedOperation<T> operation, ChildOptions options = {}) const -> Submission<T> {
@@ -898,14 +816,7 @@ public:
     explicit TransferScope(Arc<ScopeState> scope): scope_(rstd::move(scope)) {}
     TransferScope(TransferScope&&) noexcept = default;
     TransferScope(const TransferScope&)     = delete;
-    auto operator=(TransferScope&& other) noexcept -> TransferScope& {
-        if (this != &other) {
-            request_close();
-            if (scope_) scope_->cleanup->forward();
-            scope_ = rstd::move(other.scope_);
-        }
-        return *this;
-    }
+    auto operator=(TransferScope&& other) noexcept -> TransferScope&;
     ~TransferScope() {
         request_close();
         if (scope_) scope_->cleanup->forward();

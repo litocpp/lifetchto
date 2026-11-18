@@ -726,4 +726,50 @@ auto NativeBackend::wait_closed() const -> coro<CleanupReport> {
 auto NativeBackend::take_close_result() const -> Option<Result<empty>> {
     return registration_->take_release_result();
 }
+
+auto CacheScope::matches(const CacheScope& other) const -> bool {
+    if (! backend.matches(other.backend)) return false;
+    if (routing.route.is_none() || other.routing.route.is_none())
+        return routing.route.is_none() && other.routing.route.is_none();
+    return Arc<Route>::ptr_eq(*routing.route, *other.routing.route);
+}
+
+auto PreparedExchange::clone() const -> PreparedExchange {
+    auto copy = PreparedExchange(request_.clone(),
+                                 backend_.clone(),
+                                 upload_.clone(),
+                                 route_.clone(),
+                                 cache_.clone(),
+                                 cache_directive_);
+    if (proxy_.is_some()) copy.proxy_ = Some(proxy_->clone());
+#if LITO_FEAT_HTTP2
+    if (http2_.is_some()) copy.http2_ = Some(http2_->clone());
+#endif
+    return copy;
+}
+
+auto BackendCapabilities::validate_cache(CacheDirective                directive,
+                                         const lihttpto::RequestParts& parts,
+                                         const UploadMetadata& upload) const -> Result<empty> {
+    if (directive == CacheDirective::Disabled) return Ok(empty {});
+    auto supported =
+        cache.validate(directive == CacheDirective::Default      ? CacheMode::Default
+                       : directive == CacheDirective::Revalidate ? CacheMode::Revalidate
+                                                                 : CacheMode::OnlyIfCached,
+                       ""_str,
+                       StoreFailure::Bypass);
+    if (supported.is_err()) return supported;
+    if (parts.method.as_ref() == "GET"_str && upload.length == Some(u64()) &&
+        ((! cache.credentials &&
+          (parts.headers.contains("authorization"_str) || parts.headers.contains("cookie"_str))) ||
+         (! cache.range && parts.headers.contains("range"_str)) ||
+         (! cache.user_conditions && (parts.headers.contains("if-none-match"_str) ||
+                                      parts.headers.contains("if-modified-since"_str) ||
+                                      parts.headers.contains("if-match"_str) ||
+                                      parts.headers.contains("if-unmodified-since"_str) ||
+                                      parts.headers.contains("if-range"_str)))))
+        return Err(Error::Unsupported(
+            "backend cache does not support identity, range or user conditional requests"_Str));
+    return Ok(empty {});
+}
 } // namespace lifetchto::http

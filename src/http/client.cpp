@@ -1139,4 +1139,77 @@ auto Client::take_close_errors() -> Vec<Error> {
     if (result && result->is_err()) errors.push(rstd::move(*result).unwrap_err());
     return errors;
 }
+
+auto RedirectPolicy::clone() const -> RedirectPolicy {
+    return { max_hops,
+             allow_cross_origin,
+             allow_https_downgrade,
+             rewrite_post_301_302,
+             remove_on_cross_origin.clone(),
+             decider.clone() };
+}
+
+auto RetryPolicy::clone() const -> RetryPolicy {
+    return { max_retries,         connect_retries,  status_retries,
+             methods.clone(),     statuses.clone(), backoff,
+             max_backoff,         jitter,           respect_retry_after,
+             business_idempotent, decider.clone() };
+}
+
+auto ExecutionPolicy::clone() const -> ExecutionPolicy {
+    return { redirect.is_some() ? Some(redirect->clone()) : None<RedirectPolicy>(),
+             retry.is_some() ? Some(retry->clone()) : None<RetryPolicy>(),
+             cache };
+}
+
+auto AttemptReport::clone() const -> AttemptReport {
+    return { target.clone(),
+             status,
+             remote,
+             progress,
+             error.is_some() ? Some(error->clone()) : None<FailureReport>() };
+}
+
+auto ExecutionFacts::clone() const -> ExecutionFacts {
+    ExecutionFacts copy;
+    copy.request    = request.is_some() ? Some(request->clone()) : None<lihttpto::RequestParts>();
+    copy.from_cache = from_cache;
+    copy.cache      = cache;
+    copy.history_truncated = history_truncated;
+    copy.redirects         = redirects;
+    copy.attempts          = attempts;
+    copy.started           = started;
+    copy.head_received     = head_received;
+    copy.body_progress     = body_progress;
+    for (const auto& item : history) copy.history.push(item.clone());
+    return copy;
+}
+
+auto ExecutionObserver::snapshot() const -> ExecutionFacts {
+    auto f               = state_->fields.lock().unwrap();
+    auto result          = f->facts.clone();
+    result.body_progress = f->body_progress.snapshot();
+    return result;
+}
+
+auto ExecuteOptions::clone() const -> ExecuteOptions {
+    return { transfer,
+             policy.is_some() ? Some(policy->clone()) : None<ExecutionPolicy>(),
+             routing.is_some() ? Some(routing->clone()) : None<Routing>(),
+             partition.clone(),
+             report.is_some() ? Some(report->clone()) : None<ExecutionObserver>(),
+             total_timeout,
+             cookies.clone() };
+}
+
+auto ClientConfig::clone() const -> ClientConfig {
+    return { policy.clone(),
+             cache.is_some() ? Some(cache->clone()) : None<CacheBinding>(),
+             store_failure,
+             total_timeout,
+             drain_limit,
+             drain_timeout,
+             cookies.is_some() ? Some(cookies->clone()) : None<CookieBinding>(),
+             routing.clone() };
+}
 } // namespace lifetchto::http

@@ -26,12 +26,7 @@ struct CacheScope {
     BackendIdentity backend;
     RouteChoice     routing;
     auto            clone() const -> CacheScope { return { backend.clone(), routing.clone() }; }
-    auto            matches(const CacheScope& other) const -> bool {
-        if (! backend.matches(other.backend)) return false;
-        if (routing.route.is_none() || other.routing.route.is_none())
-            return routing.route.is_none() && other.routing.route.is_none();
-        return Arc<Route>::ptr_eq(*routing.route, *other.routing.route);
-    }
+    auto            matches(const CacheScope& other) const -> bool;
 };
 class PreparedExchange {
     lihttpto::PreparedRequest request_;
@@ -85,19 +80,7 @@ public:
     auto cache_scope() const -> const CacheScope& { return cache_; }
     auto proxy() const -> const Option<ProxyEndpoint>& { return proxy_; }
     void set_proxy(Option<ProxyEndpoint> proxy) { proxy_ = rstd::move(proxy); }
-    auto clone() const -> PreparedExchange {
-        auto copy = PreparedExchange(request_.clone(),
-                                     backend_.clone(),
-                                     upload_.clone(),
-                                     route_.clone(),
-                                     cache_.clone(),
-                                     cache_directive_);
-        if (proxy_.is_some()) copy.proxy_ = Some(proxy_->clone());
-#if LITO_FEAT_HTTP2
-        if (http2_.is_some()) copy.http2_ = Some(http2_->clone());
-#endif
-        return copy;
-    }
+    auto clone() const -> PreparedExchange;
 };
 struct ExchangeInput {
     PreparedExchange            prepared;
@@ -115,31 +98,10 @@ struct BackendCapabilities {
     CacheCapabilities cache;
     auto              validate_cache(CacheDirective                directive,
                                      const lihttpto::RequestParts& parts,
-                                     const UploadMetadata&         upload) const -> Result<empty> {
-        if (directive == CacheDirective::Disabled) return Ok(empty {});
-        auto supported =
-            cache.validate(directive == CacheDirective::Default      ? CacheMode::Default
-                           : directive == CacheDirective::Revalidate ? CacheMode::Revalidate
-                                                                     : CacheMode::OnlyIfCached,
-                           ""_str,
-                           StoreFailure::Bypass);
-        if (supported.is_err()) return supported;
-        if (parts.method.as_ref() == "GET"_str && upload.length == Some(u64()) &&
-            ((! cache.credentials && (parts.headers.contains("authorization"_str) ||
-                                      parts.headers.contains("cookie"_str))) ||
-             (! cache.range && parts.headers.contains("range"_str)) ||
-             (! cache.user_conditions && (parts.headers.contains("if-none-match"_str) ||
-                                          parts.headers.contains("if-modified-since"_str) ||
-                                          parts.headers.contains("if-match"_str) ||
-                                          parts.headers.contains("if-unmodified-since"_str) ||
-                                          parts.headers.contains("if-range"_str)))))
-            return Err(Error::Unsupported(
-                "backend cache does not support identity, range or user conditional requests"_Str));
-        return Ok(empty {});
-    }
-    auto validate(const lihttpto::RequestParts& parts,
-                  const UploadMetadata&         upload,
-                  const RouteChoice&            route = {}) const -> Result<empty> {
+                                     const UploadMetadata&         upload) const -> Result<empty>;
+    auto              validate(const lihttpto::RequestParts& parts,
+                               const UploadMetadata&         upload,
+                               const RouteChoice&            route = {}) const -> Result<empty> {
         if (parts.url.scheme() == Some("https"_str) && ! https)
             return Err(Error::Unsupported("backend does not support HTTPS"_Str));
         if (upload.length.is_none() && ! unknown_upload_length)

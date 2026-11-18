@@ -425,4 +425,132 @@ auto EngineHandle::scope(ScopeOptions) const -> Result<TransferScope> {
     if (admitted.is_err()) return Err(rstd::move(admitted).unwrap_err());
     return Ok(TransferScope(rstd::move(scope)));
 }
+
+auto CleanupReport::clone() const -> CleanupReport {
+    CleanupReport report;
+    report.total_errors = total_errors;
+    for (const auto& error : errors) report.errors.push(error.clone());
+    return report;
+}
+
+void CleanupReport::add(FailureReport error) {
+    ++total_errors;
+    if (errors.len() < usize(16)) errors.push(rstd::move(error));
+}
+
+void CleanupReport::merge(CleanupReport report) {
+    total_errors += report.total_errors;
+    for (auto& error : report.errors)
+        if (errors.len() < usize(16)) errors.push(rstd::move(error));
+}
+
+void CloseOutcome::complete(Result<empty> result) {
+    auto f = fields.lock().unwrap();
+    if (result.is_err()) {
+        f->report.total_errors = usize(1);
+        f->report.errors.push(report_failure(result.as_ref().unwrap_err()));
+    }
+    f->result = Some(rstd::move(result));
+}
+
+auto CloseOutcome::report() const -> CleanupReport {
+    return fields.lock().unwrap()->report.clone();
+}
+
+auto CloseOutcome::take_result() const -> Option<Result<empty>> {
+    return fields.lock().unwrap()->result.take();
+}
+
+void ResourceRecord::stop(StopReason reason) {
+    {
+        auto f = flags.lock().unwrap();
+        if (f->done) return;
+    }
+    owner->request_stop(reason);
+}
+
+auto ResourceRecord::finished() const -> bool {
+    auto f = flags.lock().unwrap();
+    return f->joined || (f->ready && f->done && task.is_some() && task->is_finished());
+}
+
+void TaskControl::cancel() const {
+    auto record = record_.upgrade();
+    if (record) record->stop(StopReason::Canceled);
+}
+
+auto TaskControl::is_finished() const -> bool {
+    auto record = record_.upgrade();
+    return ! record || record->finished();
+}
+
+auto TaskControl::wait() const -> coro<CleanupReport> {
+    return observe_resource(record_.clone(), observation_.clone());
+}
+
+auto ResourceContext::usage() const -> ResourceAmount {
+    auto f = scope_->budget->fields.lock().unwrap();
+    return f->used;
+}
+
+auto ResourceContext::closed() const -> bool {
+    auto f = scope_->fields.lock().unwrap();
+    return f->closed || scope_->cancellation.is_canceled();
+}
+
+auto ResourceContext::try_reserve(ResourceAmount amount) const -> Result<ResourcePermit> {
+    if (closed()) return Err(Error::Closed());
+    return lifetchto::try_reserve(scope_->budget.clone(), amount);
+}
+
+auto ProtocolReport::capture(const ProtocolCompletion& completion) -> ProtocolReport {
+    using ReportResult = rstd::Result<empty, FailureReport>;
+    return { completion.result.is_ok()
+                 ? ReportResult(Ok(empty {}))
+                 : ReportResult(Err(completion.diagnostic.is_some()
+                                        ? completion.diagnostic->clone()
+                                        : report_failure(completion.result.as_ref().unwrap_err()))),
+             completion.remote };
+}
+
+auto TransferControl::snapshot() const -> TransferSnapshot {
+    auto f            = state_->fields.lock().unwrap();
+    auto progress     = f->progress;
+    auto attempts     = state_->attempts->fields.lock().unwrap();
+    progress.attempts = attempts->used;
+    return { f->phase, f->output_ready, progress, state_->scope->cancellation.reason() };
+}
+
+auto TransferContext::begin_attempt() const -> Result<AttemptPermit> {
+    if (cancellation().is_canceled()) return Err(stop_error(*cancellation().reason()));
+    if (state_->deadline.is_some() && Instant::now() >= *state_->deadline)
+        return Err(Error::Timeout());
+    usize used;
+    {
+        auto f = state_->attempts->fields.lock().unwrap();
+        if (f->used >= f->maximum) return Err(Error::AttemptsExhausted());
+        used = ++f->used;
+    }
+    {
+        auto progress               = state_->fields.lock().unwrap();
+        progress->progress.attempts = used;
+    }
+    return Ok(AttemptPermit { used });
+}
+
+void TransferContext::progress(Option<u64> accepted, Option<u64> sent, Option<u64> received) const {
+    auto f                     = state_->fields.lock().unwrap();
+    f->progress.accepted_bytes = accepted;
+    f->progress.sent_bytes     = sent;
+    f->progress.received_bytes = received;
+}
+
+auto TransferScope::operator=(TransferScope&& other) noexcept -> TransferScope& {
+    if (this != &other) {
+        request_close();
+        if (scope_) scope_->cleanup->forward();
+        scope_ = rstd::move(other.scope_);
+    }
+    return *this;
+}
 } // namespace lifetchto
