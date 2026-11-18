@@ -91,6 +91,40 @@ struct Source {
     }
 };
 } // namespace
+TEST(Peer, NativeDuplexWritesAndReadsAfterHalfClose) {
+    if (! ::getenv("LIFETCHTO_DUPLEX_PORT")) GTEST_SKIP();
+    auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();
+    auto engine  = Engine::make(runtime.handle()).unwrap();
+    auto native  = http::NativeBackend::make(engine.resources()).unwrap();
+    auto client =
+        http::Client::make(engine.handle(), http::BackendBinding::Owned(native.backend())).unwrap();
+    auto url     = rstd::format("http://127.0.0.1:{}", port("LIFETCHTO_DUPLEX_PORT"));
+    auto pending = client.duplex(
+        { lihttpto::Url::parse_http(url.as_str()).unwrap(), {} },
+        { .total_timeout = Some(http::TotalTimeout::after(Duration::from_secs(u64(5)))) });
+    ASSERT_TRUE(pending.is_ok());
+    auto connected = runtime.block_on(pending->connected());
+    ASSERT_TRUE(connected.is_ok());
+    auto& connection = *connected;
+    EXPECT_TRUE(connection.can_close_input());
+    auto written = runtime.block_on(connection.write(Bytes::copy_from_slice("echo"_bytes)));
+    ASSERT_TRUE(written.is_ok());
+    EXPECT_EQ(*written, usize(4));
+    ASSERT_TRUE(runtime.block_on(connection.close_input()).is_ok());
+    Vec<u8> received;
+    for (;;) {
+        auto next = runtime.block_on(connection.next());
+        ASSERT_TRUE(next.is_ok());
+        if (next->is_none()) break;
+        received.extend_from_slice((**next).as_slice());
+    }
+    EXPECT_TRUE(received.as_slice() == "readyechoafter-eof"_bytes);
+    EXPECT_TRUE(connection.finish().is_ok());
+    (void)runtime.block_on(connection.completion().wait());
+    EXPECT_TRUE(runtime.block_on(client.close()).is_ok());
+    EXPECT_TRUE(runtime.block_on(engine.close()).is_ok());
+}
+
 TEST(Peer, BodyTrafficCountsFixedChunkedAndRedirectBodiesWithoutFraming) {
     if (! ::getenv("LIFETCHTO_PEER_PORT")) GTEST_SKIP();
     auto runtime = rstd::async::RuntimeBuilder::current_thread().enable_all().build().unwrap();

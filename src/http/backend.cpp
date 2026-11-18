@@ -5,7 +5,6 @@ import :backend;
 import :state;
 import :driver;
 import :native_body;
-import :duplex_native;
 using namespace rstd::prelude;
 using namespace rstd::literals;
 namespace lifetchto::http
